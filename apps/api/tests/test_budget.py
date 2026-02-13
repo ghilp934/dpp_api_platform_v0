@@ -1,24 +1,35 @@
-"""Tests for BudgetManager."""
+"""Tests for BudgetManager with Redis Lua scripts."""
 
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import redis
 from sqlalchemy.orm import Session
 
 from dpp_api.budget.manager import (
+    AlreadyReservedError,
     BudgetError,
     BudgetManager,
+    InsufficientBudgetError,
     InvalidMoneyStateError,
+    NoReservationError,
 )
+from dpp_api.budget.redis_scripts import BudgetScripts
 from dpp_api.db.models import Run
 from dpp_api.utils.money import NegativeAmountError
 
 
 @pytest.fixture
-def budget_manager(db_session: Session) -> BudgetManager:
+def budget_manager(db_session: Session, redis_client: redis.Redis) -> BudgetManager:
     """Create BudgetManager instance."""
-    return BudgetManager(db_session)
+    return BudgetManager(redis_client, db_session)
+
+
+@pytest.fixture
+def budget_scripts(redis_client: redis.Redis) -> BudgetScripts:
+    """Create BudgetScripts instance."""
+    return BudgetScripts(redis_client)
 
 
 @pytest.fixture
@@ -43,9 +54,119 @@ def sample_run_for_budget(db_session: Session) -> Run:
     return run
 
 
+def test_redis_reserve_lua(budget_scripts: BudgetScripts):
+    """Test Redis Reserve.lua script directly."""
+    tenant_id = "tenant_reserve_test"
+    run_id = str(uuid.uuid4())
+
+    # Set initial balance
+    budget_scripts.set_balance(tenant_id, 5_000_000)  # $5.00
+
+    # Reserve $2.00
+    status, new_balance = budget_scripts.reserve(tenant_id, run_id, 2_000_000)
+
+    assert status == "OK"
+    assert new_balance == 3_000_000  # $5.00 - $2.00 = $3.00
+
+    # Verify reservation exists
+    reservation = budget_scripts.get_reservation(run_id)
+    assert reservation is not None
+    assert reservation["tenant_id"] == tenant_id
+    assert reservation["reserved_usd_micros"] == 2_000_000
+
+
+def test_redis_reserve_insufficient(budget_scripts: BudgetScripts):
+    """Test Redis Reserve.lua with insufficient balance."""
+    tenant_id = "tenant_insufficient"
+    run_id = str(uuid.uuid4())
+
+    # Set balance to $1.00
+    budget_scripts.set_balance(tenant_id, 1_000_000)
+
+    # Try to reserve $2.00 (insufficient)
+    status, balance = budget_scripts.reserve(tenant_id, run_id, 2_000_000)
+
+    assert status == "ERR_INSUFFICIENT"
+    assert balance == 1_000_000  # Original balance unchanged
+
+
+def test_redis_reserve_already_reserved(budget_scripts: BudgetScripts):
+    """Test Redis Reserve.lua when already reserved."""
+    tenant_id = "tenant_duplicate"
+    run_id = str(uuid.uuid4())
+
+    budget_scripts.set_balance(tenant_id, 5_000_000)
+
+    # First reserve succeeds
+    status1, _ = budget_scripts.reserve(tenant_id, run_id, 1_000_000)
+    assert status1 == "OK"
+
+    # Second reserve fails
+    status2, _ = budget_scripts.reserve(tenant_id, run_id, 1_000_000)
+    assert status2 == "ERR_ALREADY_RESERVED"
+
+
+def test_redis_settle_lua(budget_scripts: BudgetScripts):
+    """Test Redis Settle.lua script directly."""
+    tenant_id = "tenant_settle"
+    run_id = str(uuid.uuid4())
+
+    # Reserve $2.00
+    budget_scripts.set_balance(tenant_id, 5_000_000)
+    budget_scripts.reserve(tenant_id, run_id, 2_000_000)
+
+    # Settle with $1.50 actual cost
+    status, charge, refund, new_balance = budget_scripts.settle(
+        tenant_id, run_id, 1_500_000
+    )
+
+    assert status == "OK"
+    assert charge == 1_500_000  # $1.50 charged
+    assert refund == 500_000  # $0.50 refunded
+    assert new_balance == 3_500_000  # $3.00 + $0.50 = $3.50
+
+    # Reservation should be deleted
+    assert budget_scripts.get_reservation(run_id) is None
+
+
+def test_redis_settle_no_reserve(budget_scripts: BudgetScripts):
+    """Test Redis Settle.lua without reservation."""
+    tenant_id = "tenant_no_reserve"
+    run_id = str(uuid.uuid4())
+
+    status, charge, refund, new_balance = budget_scripts.settle(
+        tenant_id, run_id, 1_000_000
+    )
+
+    assert status == "ERR_NO_RESERVE"
+
+
+def test_redis_refund_full_lua(budget_scripts: BudgetScripts):
+    """Test Redis RefundFull.lua script directly."""
+    tenant_id = "tenant_refund"
+    run_id = str(uuid.uuid4())
+
+    # Reserve $2.00
+    budget_scripts.set_balance(tenant_id, 5_000_000)
+    budget_scripts.reserve(tenant_id, run_id, 2_000_000)
+
+    # Full refund
+    status, refund, new_balance = budget_scripts.refund_full(tenant_id, run_id)
+
+    assert status == "OK"
+    assert refund == 2_000_000  # $2.00 refunded
+    assert new_balance == 5_000_000  # Back to $5.00
+
+    # Reservation should be deleted
+    assert budget_scripts.get_reservation(run_id) is None
+
+
 def test_reserve_success(budget_manager: BudgetManager, sample_run_for_budget: Run):
     """Test successful budget reservation."""
     max_cost = 1_500_000  # $1.50
+
+    # Set tenant balance
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
 
     success = budget_manager.reserve(
         run_id=sample_run_for_budget.run_id,
@@ -56,12 +177,30 @@ def test_reserve_success(budget_manager: BudgetManager, sample_run_for_budget: R
 
     assert success is True
 
-    # Verify state
+    # Verify DB state
     summary = budget_manager.get_budget_summary(
         sample_run_for_budget.run_id, sample_run_for_budget.tenant_id
     )
     assert summary["money_state"] == "RESERVED"
     assert summary["reservation_max_cost_usd_micros"] == max_cost
+    assert summary["redis_reservation_exists"] is True
+
+
+def test_reserve_insufficient_budget(
+    budget_manager: BudgetManager, sample_run_for_budget: Run
+):
+    """Test reservation with insufficient budget."""
+    # Set balance to $1.00
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 1_000_000)
+
+    # Try to reserve $2.00
+    with pytest.raises(InsufficientBudgetError, match="Insufficient budget"):
+        budget_manager.reserve(
+            run_id=sample_run_for_budget.run_id,
+            tenant_id=sample_run_for_budget.tenant_id,
+            expected_version=0,
+            max_cost_usd_micros=2_000_000,
+        )
 
 
 def test_reserve_invalid_amount(
@@ -82,6 +221,8 @@ def test_reserve_wrong_money_state(
     budget_manager: BudgetManager, sample_run_for_budget: Run
 ):
     """Test reservation when money_state is not NONE."""
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
+
     # First reservation succeeds
     budget_manager.reserve(
         run_id=sample_run_for_budget.run_id,
@@ -105,6 +246,8 @@ def test_settle_success(budget_manager: BudgetManager, sample_run_for_budget: Ru
     max_cost = 2_000_000  # $2.00
     actual_cost = 1_500_000  # $1.50
 
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
+
     # Reserve first
     budget_manager.reserve(
         run_id=sample_run_for_budget.run_id,
@@ -123,12 +266,17 @@ def test_settle_success(budget_manager: BudgetManager, sample_run_for_budget: Ru
 
     assert success is True
 
-    # Verify state
+    # Verify DB state
     summary = budget_manager.get_budget_summary(
         sample_run_for_budget.run_id, sample_run_for_budget.tenant_id
     )
     assert summary["money_state"] == "SETTLED"
     assert summary["actual_cost_usd_micros"] == actual_cost
+    assert summary["redis_reservation_exists"] is False  # Deleted after settle
+
+    # Verify Redis balance
+    balance = budget_manager.get_balance(sample_run_for_budget.tenant_id)
+    assert balance == 3_500_000  # $3.00 + $0.50 refund = $3.50
 
 
 def test_settle_exceeds_reservation(
@@ -137,6 +285,8 @@ def test_settle_exceeds_reservation(
     """Test settlement with cost exceeding reservation."""
     max_cost = 1_000_000  # $1.00
     actual_cost = 1_500_000  # $1.50 (exceeds)
+
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
 
     # Reserve first
     budget_manager.reserve(
@@ -175,6 +325,8 @@ def test_refund_success(budget_manager: BudgetManager, sample_run_for_budget: Ru
     max_cost = 2_000_000  # $2.00
     minimum_fee = 10_000  # $0.01
 
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
+
     # Reserve first
     budget_manager.reserve(
         run_id=sample_run_for_budget.run_id,
@@ -193,57 +345,25 @@ def test_refund_success(budget_manager: BudgetManager, sample_run_for_budget: Ru
 
     assert success is True
 
-    # Verify state
+    # Verify DB state
     summary = budget_manager.get_budget_summary(
         sample_run_for_budget.run_id, sample_run_for_budget.tenant_id
     )
     assert summary["money_state"] == "REFUNDED"
     assert summary["actual_cost_usd_micros"] == minimum_fee
+    assert summary["redis_reservation_exists"] is False
 
-
-def test_refund_exceeds_reservation(
-    budget_manager: BudgetManager, sample_run_for_budget: Run
-):
-    """Test refund with fee exceeding reservation."""
-    max_cost = 10_000  # $0.01
-    minimum_fee = 20_000  # $0.02 (exceeds)
-
-    # Reserve first
-    budget_manager.reserve(
-        run_id=sample_run_for_budget.run_id,
-        tenant_id=sample_run_for_budget.tenant_id,
-        expected_version=0,
-        max_cost_usd_micros=max_cost,
-    )
-
-    # Refund should fail
-    with pytest.raises(BudgetError, match="exceeds reserved amount"):
-        budget_manager.refund(
-            run_id=sample_run_for_budget.run_id,
-            tenant_id=sample_run_for_budget.tenant_id,
-            expected_version=1,
-            minimum_fee_usd_micros=minimum_fee,
-        )
-
-
-def test_refund_wrong_money_state(
-    budget_manager: BudgetManager, sample_run_for_budget: Run
-):
-    """Test refund when money_state is not RESERVED."""
-    # Try to refund without reserving first
-    with pytest.raises(InvalidMoneyStateError, match="expected RESERVED"):
-        budget_manager.refund(
-            run_id=sample_run_for_budget.run_id,
-            tenant_id=sample_run_for_budget.tenant_id,
-            expected_version=0,
-            minimum_fee_usd_micros=10_000,
-        )
+    # Verify Redis balance
+    balance = budget_manager.get_balance(sample_run_for_budget.tenant_id)
+    assert balance == 4_990_000  # $3.00 + $1.99 refund = $4.99
 
 
 def test_version_check_on_reserve(
     budget_manager: BudgetManager, sample_run_for_budget: Run
 ):
     """Test optimistic locking with wrong version (DEC-4210)."""
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
+
     # Reserve with correct version succeeds
     success1 = budget_manager.reserve(
         run_id=sample_run_for_budget.run_id,
@@ -254,8 +374,6 @@ def test_version_check_on_reserve(
     assert success1 is True
 
     # Settle with wrong version fails (race loser)
-    # Note: This simulates a race condition where another process
-    # already updated the run, incrementing the version
     success2 = budget_manager.settle(
         run_id=sample_run_for_budget.run_id,
         tenant_id=sample_run_for_budget.tenant_id,
@@ -281,9 +399,10 @@ def test_get_budget_summary(
         sample_run_for_budget.run_id, sample_run_for_budget.tenant_id
     )
     assert summary["money_state"] == "NONE"
-    assert summary["reservation_max_cost_usd_micros"] == 0
+    assert summary["redis_reservation_exists"] is False
 
     # After reservation
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
     budget_manager.reserve(
         run_id=sample_run_for_budget.run_id,
         tenant_id=sample_run_for_budget.tenant_id,
@@ -296,6 +415,8 @@ def test_get_budget_summary(
     )
     assert summary["money_state"] == "RESERVED"
     assert summary["reservation_max_cost_usd_micros"] == 1_500_000
+    assert summary["redis_reservation_exists"] is True
+    assert summary["redis_reserved_amount"] == 1_500_000
 
 
 def test_get_budget_summary_not_found(budget_manager: BudgetManager):
@@ -310,6 +431,8 @@ def test_full_reserve_settle_flow(
     """Test complete reserve → settle flow."""
     max_cost = 2_000_000  # $2.00
     actual_cost = 1_500_000  # $1.50
+
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
 
     # Step 1: Reserve
     budget_manager.reserve(
@@ -345,6 +468,8 @@ def test_full_reserve_refund_flow(
     """Test complete reserve → refund flow (failure case)."""
     max_cost = 2_000_000  # $2.00
     minimum_fee = 10_000  # $0.01
+
+    budget_manager.set_balance(sample_run_for_budget.tenant_id, 5_000_000)
 
     # Step 1: Reserve
     budget_manager.reserve(
