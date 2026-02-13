@@ -25,6 +25,7 @@ from dpp_api.schemas import (
     RunReceipt,
     RunStatusResponse,
 )
+from dpp_api.storage import get_s3_client
 from dpp_api.utils.hashing import compute_payload_hash
 from dpp_api.utils.money import format_usd_micros, parse_usd_string
 
@@ -94,7 +95,7 @@ async def create_run(
     # PlanViolationError is handled by global exception handler (RFC 9457)
     redis_client = RedisClient.get_client()
     plan_enforcer = PlanEnforcer(db, redis_client)
-    plan_enforcer.enforce(
+    plan = plan_enforcer.enforce(
         tenant_id=tenant_id,
         pack_type=request.pack_type,
         max_cost_usd_micros=max_cost_usd_micros,
@@ -259,6 +260,11 @@ async def create_run(
     if run.actual_cost_usd_micros is not None:
         response.headers["X-DPP-Cost-Actual"] = format_usd_micros(run.actual_cost_usd_micros)
 
+    # P1-2: Add rate limit headers
+    rate_limit_headers = plan_enforcer.get_rate_limit_headers_post(plan, tenant_id)
+    for header_name, header_value in rate_limit_headers.items():
+        response.headers[header_name] = header_value
+
     # Success - return receipt
     return _build_receipt(run)
 
@@ -333,11 +339,30 @@ async def get_run(
     error_info = None
 
     if run.status == "COMPLETED" and run.result_key:
-        # TODO: Generate presigned URL for S3 result
+        # P1-1: Generate presigned URL for S3 result (TTL: 600s)
+        presigned_url = None
+        expires_at = None
+
+        if run.result_bucket and run.result_key:
+            try:
+                s3_client = get_s3_client()
+                presigned_url, expires_at = s3_client.generate_presigned_url(
+                    bucket=run.result_bucket,
+                    key=run.result_key,
+                    ttl_seconds=600,  # P1-1: 10 minutes TTL
+                )
+            except Exception as e:
+                # Log error but don't fail the request
+                # Client can still see that run is COMPLETED, just can't download result
+                logger.error(
+                    f"Failed to generate presigned URL for run {run_id}: {e}",
+                    exc_info=True,
+                )
+
         result_info = ResultInfo(
-            presigned_url=None,  # Will be implemented with S3 client
+            presigned_url=presigned_url,
             sha256=run.result_sha256,
-            expires_at=None,
+            expires_at=expires_at,
         )
     elif run.status == "FAILED":
         error_info = ErrorInfo(
@@ -350,6 +375,11 @@ async def get_run(
     response.headers["X-DPP-Cost-Minimum-Fee"] = format_usd_micros(run.minimum_fee_usd_micros)
     if run.actual_cost_usd_micros is not None:
         response.headers["X-DPP-Cost-Actual"] = format_usd_micros(run.actual_cost_usd_micros)
+
+    # P1-2: Add rate limit headers
+    rate_limit_headers = plan_enforcer.get_rate_limit_headers_poll(plan, tenant_id)
+    for header_name, header_value in rate_limit_headers.items():
+        response.headers[header_name] = header_value
 
     return RunStatusResponse(
         run_id=run.run_id,

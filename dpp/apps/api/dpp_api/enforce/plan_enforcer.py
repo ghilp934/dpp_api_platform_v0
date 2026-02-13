@@ -244,6 +244,88 @@ class PlanEnforcer:
         # Increment count
         self.redis.incr(rate_key)
 
+    def get_rate_limit_headers_post(self, plan: Plan, tenant_id: str) -> dict[str, str]:
+        """Get rate limit headers for POST /runs endpoint.
+
+        P1-2: Standardized rate limit headers for all responses.
+
+        Args:
+            plan: Active Plan object
+            tenant_id: Tenant ID
+
+        Returns:
+            Dict of rate limit headers (X-RateLimit-*)
+        """
+        limits = plan.limits_json or {}
+        rate_limit = limits.get("rate_limit_post_per_min", 0)
+
+        if rate_limit == 0:
+            # No rate limit configured
+            return {}
+
+        # Redis key for rate limiting
+        rate_key = f"rate_limit:post_runs:{tenant_id}"
+
+        # Get current count and TTL
+        current_count = self.redis.get(rate_key)
+        ttl = self.redis.ttl(rate_key)
+
+        # Calculate remaining
+        used = int(current_count) if current_count else 0
+        remaining = max(0, rate_limit - used)
+
+        # Calculate reset time (current time + TTL)
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        reset_time = int(now.timestamp()) + (ttl if ttl > 0 else 60)
+
+        return {
+            "X-RateLimit-Limit": str(rate_limit),
+            "X-RateLimit-Remaining": str(remaining),
+            "X-RateLimit-Reset": str(reset_time),
+        }
+
+    def get_rate_limit_headers_poll(self, plan: Plan, tenant_id: str) -> dict[str, str]:
+        """Get rate limit headers for GET /runs/{id} endpoint.
+
+        P1-2: Standardized rate limit headers for all responses.
+
+        Args:
+            plan: Active Plan object
+            tenant_id: Tenant ID
+
+        Returns:
+            Dict of rate limit headers (X-RateLimit-*)
+        """
+        limits = plan.limits_json or {}
+        rate_limit = limits.get("rate_limit_poll_per_min", 0)
+
+        if rate_limit == 0:
+            # No rate limit configured
+            return {}
+
+        # Redis key for rate limiting
+        rate_key = f"rate_limit:poll_runs:{tenant_id}"
+
+        # Get current count and TTL
+        current_count = self.redis.get(rate_key)
+        ttl = self.redis.ttl(rate_key)
+
+        # Calculate remaining
+        used = int(current_count) if current_count else 0
+        remaining = max(0, rate_limit - used)
+
+        # Calculate reset time (current time + TTL)
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        reset_time = int(now.timestamp()) + (ttl if ttl > 0 else 60)
+
+        return {
+            "X-RateLimit-Limit": str(rate_limit),
+            "X-RateLimit-Remaining": str(remaining),
+            "X-RateLimit-Reset": str(reset_time),
+        }
+
     def enforce(
         self,
         tenant_id: str,
