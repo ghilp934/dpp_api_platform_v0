@@ -1,0 +1,1 @@
+"""SQS-compatible queue client."""
