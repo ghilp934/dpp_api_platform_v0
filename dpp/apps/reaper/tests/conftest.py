@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../api"))
 import pytest
 import redis
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -24,31 +25,40 @@ REDIS_TEST_DB = 15  # Use separate DB for tests
 
 
 @pytest.fixture(scope="function")
-def db_session() -> Session:
-    """
-    Create a fresh database session for each test.
+def db_engine() -> Engine:
+    """Create a shared database engine for multi-threaded tests.
 
-    Uses in-memory SQLite for fast, isolated tests.
+    This allows multiple threads to create their own sessions
+    while sharing the same in-memory database.
     """
-    # Create in-memory engine
     engine = create_engine(
         TEST_DATABASE_URL,
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-
-    # Create all tables
     Base.metadata.create_all(engine)
 
-    # Create session
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    try:
+        yield engine
+    finally:
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+@pytest.fixture(scope="function")
+def db_session(db_engine: Engine) -> Session:
+    """
+    Create a fresh database session for each test.
+
+    Uses the shared engine from db_engine fixture.
+    """
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
     session = SessionLocal()
 
     try:
         yield session
     finally:
         session.close()
-        Base.metadata.drop_all(engine)
 
 
 @pytest.fixture(scope="function")

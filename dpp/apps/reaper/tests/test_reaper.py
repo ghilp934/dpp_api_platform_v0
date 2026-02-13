@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../worker"))
 
 import pytest
 import redis
-from sqlalchemy.orm import Session
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from dpp_api.budget import BudgetManager
 from dpp_api.budget.redis_scripts import BudgetScripts
@@ -330,7 +331,7 @@ def test_reaper_loop_one_iteration(db_session: Session, redis_client: redis.Redi
 
 
 def test_worker_vs_reaper_race_exactly_once_finalize(
-    db_session: Session, redis_client: redis.Redis
+    db_engine: Engine, db_session: Session, redis_client: redis.Redis
 ):
     """CRITICAL TEST: Worker vs Reaper race - exactly one WINNER, no double-settle.
 
@@ -369,17 +370,17 @@ def test_worker_vs_reaper_race_exactly_once_finalize(
     budget_scripts = BudgetScripts(redis_client)
     budget_scripts.set_balance(tenant_id, 10_000_000)  # $10.00
 
+    budget_manager = BudgetManager(redis_client, db_session)
+
+    # Get initial balance BEFORE reserve for accurate charge calculation
+    initial_balance = budget_manager.get_balance(tenant_id)
+
     # Create reserve (CRITICAL: Both Worker and Reaper expect active reserve)
     budget_scripts.reserve(
         tenant_id=tenant_id,
         run_id=run_id,
-        max_cost_usd_micros=run.reservation_max_cost_usd_micros,
+        reserved_usd_micros=run.reservation_max_cost_usd_micros,
     )
-
-    budget_manager = BudgetManager(redis_client, db_session)
-
-    # Get initial balance for verification
-    initial_balance = budget_manager.get_balance(tenant_id)
 
     # Results
     worker_result = {"won": None, "error": None}
@@ -387,6 +388,11 @@ def test_worker_vs_reaper_race_exactly_once_finalize(
 
     def worker_finalize():
         """Worker thread: Attempts finalize_success."""
+        # Create independent session for this thread
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
+        worker_session = SessionLocal()
+        worker_budget_mgr = BudgetManager(redis_client, worker_session)
+
         try:
             finalize_success(
                 run_id=run_id,
@@ -396,23 +402,44 @@ def test_worker_vs_reaper_race_exactly_once_finalize(
                 result_bucket="test-bucket",
                 result_key="test-key",
                 result_sha256="abc123",
-                db=db_session,
-                budget_manager=budget_manager,
+                db=worker_session,
+                budget_manager=worker_budget_mgr,
             )
+            worker_session.commit()  # CRITICAL: Commit changes
             worker_result["won"] = True
         except ClaimError as e:
+            worker_session.rollback()
             worker_result["won"] = False
             worker_result["error"] = str(e)
         except Exception as e:
+            worker_session.rollback()
             worker_result["error"] = f"Unexpected: {e}"
+        finally:
+            worker_session.close()
 
     def reaper_finalize():
         """Reaper thread: Attempts finalize_timeout."""
+        # Create independent session for this thread
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
+        reaper_session = SessionLocal()
+        reaper_budget_mgr = BudgetManager(redis_client, reaper_session)
+
         try:
-            won = reap_run(run, db_session, budget_manager)
-            reaper_result["won"] = won
+            # Fetch run from this thread's session
+            reaper_repo = RunRepository(reaper_session)
+            reaper_run = reaper_repo.get_by_id(run_id, tenant_id)
+            if reaper_run:
+                won = reap_run(reaper_run, reaper_session, reaper_budget_mgr)
+                if won:
+                    reaper_session.commit()  # CRITICAL: Commit changes
+                reaper_result["won"] = won
+            else:
+                reaper_result["error"] = "Run not found"
         except Exception as e:
+            reaper_session.rollback()
             reaper_result["error"] = f"Unexpected: {e}"
+        finally:
+            reaper_session.close()
 
     # Start both threads simultaneously
     worker_thread = Thread(target=worker_finalize)
@@ -429,22 +456,46 @@ def test_worker_vs_reaper_race_exactly_once_finalize(
     # CRITICAL ASSERTIONS
     # ========================================
 
+    # Debug: Print results
+    print(f"Worker result: {worker_result}")
+    print(f"Reaper result: {reaper_result}")
+
     # 1. No unexpected errors
-    assert worker_result["error"] is None or "already claimed" in worker_result["error"]
-    assert reaper_result["error"] is None
+    assert worker_result["error"] is None or "already claimed" in worker_result["error"].lower(), \
+        f"Worker unexpected error: {worker_result['error']}"
+    assert reaper_result["error"] is None, \
+        f"Reaper unexpected error: {reaper_result['error']}"
 
     # 2. Exactly ONE winner
     winners = sum([worker_result["won"] is True, reaper_result["won"] is True])
-    assert winners == 1, f"Expected exactly 1 winner, got {winners}"
+    assert winners == 1, f"Expected exactly 1 winner, got {winners} (worker={worker_result['won']}, reaper={reaper_result['won']})"
 
     # 3. Verify final run state (should be finalized by winner)
+    # Create fresh session to see committed changes
+    db_session.expire_all()  # Clear cache
     final_run = repo.get_by_id(run_id, tenant_id)
-    assert final_run.status in ["COMPLETED", "FAILED"]
+    if not final_run:
+        # Try with fresh session
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
+        fresh_session = SessionLocal()
+        fresh_repo = RunRepository(fresh_session)
+        final_run = fresh_repo.get_by_id(run_id, tenant_id)
+        fresh_session.close()
+
+    assert final_run is not None, "Run disappeared!"
+    assert final_run.status in ["COMPLETED", "FAILED"], \
+        f"Expected finalized status, got {final_run.status}"
     assert final_run.money_state == "SETTLED"
     assert final_run.finalize_stage == "COMMITTED"
 
     # 4. Verify budget settled exactly ONCE (no double-charge)
-    final_balance = budget_manager.get_balance(tenant_id)
+    # Use fresh budget manager to get accurate balance
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
+    verify_session = SessionLocal()
+    verify_budget_mgr = BudgetManager(redis_client, verify_session)
+    final_balance = verify_budget_mgr.get_balance(tenant_id)
+    verify_session.close()
+
     charged = initial_balance - final_balance
 
     if final_run.status == "COMPLETED":

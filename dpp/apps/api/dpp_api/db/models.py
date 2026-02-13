@@ -3,7 +3,7 @@
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from sqlalchemy import BIGINT, DATE, FLOAT, JSON, TEXT, TIMESTAMP, UUID, Index
+from sqlalchemy import BIGINT, DATE, FLOAT, JSON, TEXT, TIMESTAMP, UUID, Index, Integer
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -187,7 +187,7 @@ class TenantPlan(Base):
 
     __tablename__ = "tenant_plans"
 
-    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tenant_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
     plan_id: Mapped[str] = mapped_column(TEXT, nullable=False)
 
@@ -227,7 +227,7 @@ class TenantUsageDaily(Base):
 
     __tablename__ = "tenant_usage_daily"
 
-    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tenant_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
     usage_date: Mapped[date] = mapped_column(DATE, nullable=False)
 
