@@ -96,3 +96,46 @@ class RunStatusResponse(BaseModel):
     result: Optional[ResultInfo] = None
     error: Optional[ErrorInfo] = None
     meta: dict[str, Any]
+
+
+# ============================================================================
+# RFC 9457 Problem Details (DEC-4213)
+# ============================================================================
+
+
+class ProblemDetail(BaseModel):
+    """RFC 9457 Problem Details for HTTP API errors.
+
+    Used for plan enforcement violations and other API errors.
+    """
+
+    type: str = Field(..., description="URI reference identifying the problem type")
+    title: str = Field(..., description="Short, human-readable summary")
+    status: int = Field(..., description="HTTP status code")
+    detail: str = Field(..., description="Human-readable explanation specific to this occurrence")
+    instance: Optional[str] = Field(None, description="URI reference identifying the specific occurrence")
+
+
+# ============================================================================
+# GET /v1/tenants/{tenant_id}/usage - Response
+# ============================================================================
+
+
+class UsageDailySummary(BaseModel):
+    """Daily usage summary for a tenant."""
+
+    usage_date: str = Field(..., description="Date in YYYY-MM-DD format")
+    runs_count: int
+    success_count: int
+    fail_count: int
+    cost_usd_micros_sum: int
+    reserved_usd_micros_sum: int
+
+
+class UsageResponse(BaseModel):
+    """Response for GET /v1/tenants/{tenant_id}/usage."""
+
+    tenant_id: str
+    from_date: str = Field(..., description="Start date (inclusive) in YYYY-MM-DD")
+    to_date: str = Field(..., description="End date (inclusive) in YYYY-MM-DD")
+    daily_usage: list[UsageDailySummary]

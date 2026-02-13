@@ -13,11 +13,13 @@ from dpp_api.db.models import Run
 from dpp_api.db.redis_client import RedisClient
 from dpp_api.db.repo_runs import RunRepository
 from dpp_api.db.session import get_db
+from dpp_api.enforce import PlanEnforcer, PlanViolationError
 from dpp_api.queue.sqs_client import get_sqs_client
 from dpp_api.schemas import (
     CostInfo,
     ErrorInfo,
     PollInfo,
+    ProblemDetail,
     ResultInfo,
     RunCreateRequest,
     RunReceipt,
@@ -77,6 +79,28 @@ async def create_run(
 
     # Parse max_cost_usd to micros (DEC-4211)
     max_cost_usd_micros = parse_usd_string(request.reservation.max_cost_usd)
+
+    # STEP B: Plan enforcement (API monetization)
+    try:
+        redis_client = RedisClient.get_client()
+        plan_enforcer = PlanEnforcer(db, redis_client)
+        plan_enforcer.enforce(
+            tenant_id=tenant_id,
+            pack_type=request.pack_type,
+            max_cost_usd_micros=max_cost_usd_micros,
+        )
+    except PlanViolationError as e:
+        # DEC-4213: Return RFC 9457 Problem Detail
+        raise HTTPException(
+            status_code=e.status_code,
+            detail=ProblemDetail(
+                type=e.error_type,
+                title=e.title,
+                status=e.status_code,
+                detail=e.detail,
+                instance=f"/v1/runs",
+            ).model_dump(),
+        )
 
     # Calculate minimum fee (DEC-4203)
     # minimum_fee = max(0.005, 0.02 * reserved_usd), cap <= 0.10
