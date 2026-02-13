@@ -150,9 +150,43 @@ class WorkerLoop:
             logger.error(f"Run {run_id} not found")
             return True  # Permanent error - delete message
 
+        # P0 FIX-2: Only delete if run is in terminal state
+        # PROCESSING means finalize is in progress - do NOT delete message
         if run.status != "QUEUED":
-            logger.warning(f"Run {run_id} status is {run.status}, expected QUEUED (skip)")
-            return True  # Already processed or failed - delete message
+            # Terminal states - safe to delete message
+            TERMINAL_STATES = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"}
+
+            if run.status in TERMINAL_STATES:
+                logger.info(
+                    f"Run {run_id} in terminal state {run.status} (finalize_stage={run.finalize_stage}) - delete message"
+                )
+                return True  # Terminal state - delete message
+
+            elif run.status == "PROCESSING":
+                # PROCESSING means another worker or finalize in progress
+                # Do NOT delete - let it complete or timeout
+                logger.warning(
+                    f"Run {run_id} status=PROCESSING (finalize_stage={run.finalize_stage}) - "
+                    f"do NOT delete message (finalize may be in progress)"
+                )
+
+                # Optional: Extend visibility timeout to reduce receive_count churn
+                try:
+                    self.sqs.change_message_visibility(
+                        QueueUrl=self.queue_url,
+                        ReceiptHandle=receipt_handle,
+                        VisibilityTimeout=60,  # Give finalize 60s to complete
+                    )
+                    logger.debug(f"Extended message visibility by 60s for run {run_id}")
+                except Exception as vis_error:
+                    logger.warning(f"Failed to extend visibility: {vis_error}")
+
+                return False  # Do NOT delete - allow retry/completion
+
+            else:
+                # Unknown state - log and skip (delete to avoid infinite loop)
+                logger.warning(f"Run {run_id} in unexpected state {run.status} - delete message")
+                return True
 
         # 2. QUEUED -> PROCESSING (DB-CAS + lease)
         lease_token = str(uuid.uuid4())
@@ -243,6 +277,11 @@ class WorkerLoop:
             heartbeat.stop()
             logger.debug(f"Heartbeat stopped before finalize for run {run_id}")
 
+            # P0 FIX-1: Invalidate session cache to get latest version from heartbeat
+            # Heartbeat thread may have incremented run.version in parallel session
+            self.db.expire_all()
+            logger.debug(f"DB session cache invalidated before claim_finalize for run {run_id}")
+
             try:
                 finalize_token, claimed_version = claim_finalize(
                     run_id=run_id,
@@ -254,9 +293,32 @@ class WorkerLoop:
 
             except ClaimError as e:
                 logger.warning(f"Run {run_id} claim failed (LOSER): {e}")
-                # P0-1: Another worker or reaper already finalized - this is OK
-                # Do NOT upload to S3 since we lost the race
-                # Do NOT delete SQS message - allow retry in case of transient issue
+
+                # P1 IMPROVEMENT: Check if run is already finalized (LOSER case)
+                # Reload latest run state to see if another worker completed it
+                self.db.expire_all()
+                latest_run = self.repo.get_by_id(run_id, tenant_id)
+
+                if latest_run:
+                    # If already COMMITTED or terminal, safe to delete message (true LOSER)
+                    if latest_run.finalize_stage == "COMMITTED" or latest_run.status in {
+                        "COMPLETED",
+                        "FAILED",
+                        "TIMED_OUT",
+                        "CANCELLED",
+                    }:
+                        logger.info(
+                            f"Run {run_id} already finalized (stage={latest_run.finalize_stage}, "
+                            f"status={latest_run.status}) - delete duplicate message"
+                        )
+                        return True  # Safe to delete - another worker won
+
+                # Not finalized yet - could be transient version conflict
+                # Do NOT delete message - allow retry
+                logger.warning(
+                    f"Run {run_id} claim failed but not yet finalized - "
+                    f"do NOT delete message (allow retry)"
+                )
                 return False
 
             # 6. PHASE 2: S3 UPLOAD (only after successful claim)
@@ -328,6 +390,10 @@ class WorkerLoop:
             heartbeat.stop()
             logger.debug(f"Heartbeat stopped before failure finalize for run {run_id}")
 
+            # P0 FIX-1: Invalidate session cache before finalize_failure
+            self.db.expire_all()
+            logger.debug(f"DB session cache invalidated before finalize_failure for run {run_id}")
+
             # 7. 2-phase finalize (FAILURE)
             try:
                 result = finalize_failure(
@@ -349,9 +415,27 @@ class WorkerLoop:
                 # P0-1: Failure finalized - delete message
                 return True
 
-            except ClaimError as e:
-                logger.warning(f"Run {run_id} failure claim failed (LOSER): {e}")
-                # P0-1: Another worker finalized - don't delete message, allow retry
+            except ClaimError as claim_err:
+                logger.warning(f"Run {run_id} failure claim failed (LOSER): {claim_err}")
+
+                # P1 IMPROVEMENT: Check if already finalized
+                self.db.expire_all()
+                latest_run = self.repo.get_by_id(run_id, tenant_id)
+
+                if latest_run:
+                    if latest_run.finalize_stage == "COMMITTED" or latest_run.status in {
+                        "COMPLETED",
+                        "FAILED",
+                        "TIMED_OUT",
+                        "CANCELLED",
+                    }:
+                        logger.info(
+                            f"Run {run_id} already finalized (failure path) - delete duplicate message"
+                        )
+                        return True
+
+                # Not finalized - don't delete message, allow retry
+                logger.warning(f"Run {run_id} failure claim failed but not finalized - allow retry")
                 return False
 
             except FinalizeError as e:
