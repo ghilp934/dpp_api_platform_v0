@@ -9,6 +9,8 @@ from typing import Literal, Optional
 
 import redis
 
+from dpp_api.constants import RESERVATION_TTL_SECONDS
+
 # Key naming conventions (locked spec)
 # - budget:{tenant_id}:balance_usd_micros (string int)
 # - reserve:{run_id} (hash: reserved_usd_micros, tenant_id, created_at_ms) TTL=3600s
@@ -158,8 +160,8 @@ class BudgetScripts:
         status = result[0]
         if status == "OK":
             new_balance = int(result[1])
-            # Set TTL on reserve key (3600s = 1 hour)
-            self.redis.expire(reserve_key, 3600)
+            # Set TTL on reserve key (MS-6: must match reconcile TTL safety check)
+            self.redis.expire(reserve_key, RESERVATION_TTL_SECONDS)
             return ("OK", new_balance)
         elif status == "ERR_INSUFFICIENT":
             current_balance = int(result[1])

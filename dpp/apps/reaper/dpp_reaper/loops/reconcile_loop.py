@@ -24,6 +24,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from dpp_api.budget import BudgetManager
+from dpp_api.constants import RESERVATION_TTL_SECONDS
 from dpp_api.db.models import Run
 from dpp_api.db.redis_client import RedisClient
 from dpp_api.db.repo_runs import RunRepository
@@ -155,7 +156,9 @@ def roll_forward_stuck_run(
         # Calculate charge (actual_cost should already be in run record, but defensive)
         charge_usd_micros = run.actual_cost_usd_micros or run.reservation_max_cost_usd_micros
 
-        # STEP 1: Settle budget (idempotent - Redis settle script handles duplicate calls)
+        # STEP 1: Settle budget
+        # NOTE: settle() is NOT idempotent (deletes reservation on first call)
+        # Protection: optimistic locking (version check) below prevents double-commit
         settle_status, returned_charge, refund, new_balance = budget_manager.scripts.settle(
             tenant_id, run_id, charge_usd_micros
         )
@@ -397,7 +400,7 @@ def reconcile_stuck_claimed_run(
 
     # CRITICAL: Reservation missing - need TTL safety check
     # Safety Guard #1: TTL-based disambiguation
-    RESERVATION_TTL = 3600  # 1 hour (must match Redis TTL config)
+    # Use centralized constant to prevent drift (MS-6 critical)
 
     # Handle both naive and aware datetimes (defensive programming)
     created_at = run.created_at
@@ -407,15 +410,15 @@ def reconcile_stuck_claimed_run(
 
     age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
 
-    if age_seconds >= RESERVATION_TTL:
+    if age_seconds >= RESERVATION_TTL_SECONDS:
         # Safety Guard #1: Age >= TTL → Ambiguous case (could be expired/evicted)
         logger.warning(
-            f"MS-6: Run {run_id} age={age_seconds:.0f}s >= TTL={RESERVATION_TTL}s, "
+            f"MS-6: Run {run_id} age={age_seconds:.0f}s >= TTL={RESERVATION_TTL_SECONDS}s, "
             f"marking AUDIT_REQUIRED (ambiguous reservation missing)",
             extra={
                 "run_id": run_id,
                 "age_seconds": age_seconds,
-                "ttl_seconds": RESERVATION_TTL,
+                "ttl_seconds": RESERVATION_TTL_SECONDS,
                 "reconcile_type": "audit_required",
             },
         )
@@ -436,7 +439,7 @@ def reconcile_stuck_claimed_run(
                 "actual_cost_usd_micros": charge_minimum_fee,
                 "finalize_stage": "COMMITTED",
                 "last_error_reason_code": "MS6_AMBIGUOUS_RESERVATION_MISSING",
-                "last_error_detail": f"Reservation missing after TTL expiry (age={age_seconds:.0f}s >= {RESERVATION_TTL}s)",
+                "last_error_detail": f"Reservation missing after TTL expiry (age={age_seconds:.0f}s >= {RESERVATION_TTL_SECONDS}s)",
                 "completed_at": datetime.now(timezone.utc),
             },
         )
@@ -444,12 +447,12 @@ def reconcile_stuck_claimed_run(
 
     # Safety Guard #1: Age < TTL → Safe to assume settle already succeeded
     logger.info(
-        f"MS-6: Run {run_id} age={age_seconds:.0f}s < TTL={RESERVATION_TTL}s, "
+        f"MS-6: Run {run_id} age={age_seconds:.0f}s < TTL={RESERVATION_TTL_SECONDS}s, "
         f"safe to assume settle succeeded (idempotent force-settle)",
         extra={
             "run_id": run_id,
             "age_seconds": age_seconds,
-            "ttl_seconds": RESERVATION_TTL,
+            "ttl_seconds": RESERVATION_TTL_SECONDS,
             "reconcile_type": "idempotent_force_settle",
         },
     )
