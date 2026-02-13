@@ -263,6 +263,34 @@ class BudgetScripts:
         budget_key = self.budget_key(tenant_id)
         self.redis.set(budget_key, str(balance_usd_micros))
 
+    def set_initial_balance(self, tenant_id: str, initial_balance_usd_micros: int) -> None:
+        """
+        Set initial budget balance for reconciliation audit (MS-6).
+
+        This tracks the starting balance to enable verification that
+        (initial - current - reserved) == DB settled amount.
+
+        Args:
+            tenant_id: Tenant ID
+            initial_balance_usd_micros: Initial balance in USD_MICROS
+        """
+        initial_key = f"budget:{tenant_id}:initial_balance_usd_micros"
+        self.redis.set(initial_key, str(initial_balance_usd_micros))
+
+    def get_initial_balance(self, tenant_id: str) -> int:
+        """
+        Get initial budget balance (MS-6).
+
+        Args:
+            tenant_id: Tenant ID
+
+        Returns:
+            Initial balance in USD_MICROS, or 0 if not set
+        """
+        initial_key = f"budget:{tenant_id}:initial_balance_usd_micros"
+        balance = self.redis.get(initial_key)
+        return int(balance) if balance else 0
+
     def get_reservation(self, run_id: str) -> Optional[dict]:
         """
         Get reservation details.
