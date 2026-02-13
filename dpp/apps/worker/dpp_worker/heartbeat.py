@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,9 @@ class HeartbeatThread(threading.Thread):
     Extends:
     - DB lease_expires_at (prevents Reaper from timing out)
     - SQS visibility timeout (prevents duplicate processing)
+
+    P0-1: Thread-safe session management.
+    Creates a new Session for each heartbeat tick to avoid thread-safety issues.
     """
 
     def __init__(
@@ -32,7 +35,7 @@ class HeartbeatThread(threading.Thread):
         tenant_id: str,
         lease_token: str,
         current_version: int,
-        db_session: Session,
+        session_factory: Callable[[], Session],
         sqs_client: Any,
         queue_url: str,
         receipt_handle: str,
@@ -46,7 +49,7 @@ class HeartbeatThread(threading.Thread):
             tenant_id: Tenant ID
             lease_token: Lease token to verify ownership
             current_version: Current version for optimistic locking
-            db_session: Database session
+            session_factory: SessionLocal factory for creating thread-safe sessions
             sqs_client: boto3 SQS client
             queue_url: SQS queue URL
             receipt_handle: SQS message receipt handle
@@ -58,14 +61,13 @@ class HeartbeatThread(threading.Thread):
         self.tenant_id = tenant_id
         self.lease_token = lease_token
         self.current_version = current_version
-        self.db = db_session
+        self.session_factory = session_factory
         self.sqs = sqs_client
         self.queue_url = queue_url
         self.receipt_handle = receipt_handle
         self.heartbeat_interval_sec = heartbeat_interval_sec
         self.lease_extension_sec = lease_extension_sec
         self.stop_event = threading.Event()
-        self.repo = RunRepository(db_session)
 
     def run(self) -> None:
         """Run heartbeat loop until stopped."""
@@ -94,39 +96,46 @@ class HeartbeatThread(threading.Thread):
         logger.info(f"Heartbeat thread stopped for run {self.run_id}")
 
     def _send_heartbeat(self) -> None:
-        """Send heartbeat: extend DB lease and SQS visibility."""
+        """Send heartbeat: extend DB lease and SQS visibility.
+
+        P0-1: Creates a new Session for each tick to ensure thread-safety.
+        """
         # 1. Extend DB lease_expires_at
         new_lease_expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=self.lease_extension_sec
         )
 
-        # P0-D: Use optimistic locking to extend lease
-        # Version will increment with each heartbeat (this is OK - not a state change)
-        success = self.repo.update_with_version_check(
-            run_id=self.run_id,
-            tenant_id=self.tenant_id,
-            expected_version=self.current_version,
-            updates={
-                "lease_expires_at": new_lease_expires_at,
-            },
-            extra_conditions={
-                "lease_token": self.lease_token,  # Verify we still own the lease
-                "status": "PROCESSING",  # Only extend if still processing
-            },
-        )
+        # P0-1: Create new session for each heartbeat (thread-safe)
+        with self.session_factory() as session:
+            repo = RunRepository(session)
 
-        if success:
-            # Update our version for next heartbeat
-            self.current_version += 1
-            logger.debug(
-                f"DB lease extended for run {self.run_id} until {new_lease_expires_at} "
-                f"(version={self.current_version})"
+            # P0-D: Use optimistic locking to extend lease
+            # Version will increment with each heartbeat (this is OK - not a state change)
+            success = repo.update_with_version_check(
+                run_id=self.run_id,
+                tenant_id=self.tenant_id,
+                expected_version=self.current_version,
+                updates={
+                    "lease_expires_at": new_lease_expires_at,
+                },
+                extra_conditions={
+                    "lease_token": self.lease_token,  # Verify we still own the lease
+                    "status": "PROCESSING",  # Only extend if still processing
+                },
             )
-        else:
-            logger.warning(
-                f"DB lease extension failed for run {self.run_id} "
-                f"(version conflict, lease_token mismatch, or status changed)"
-            )
+
+            if success:
+                # Update our version for next heartbeat
+                self.current_version += 1
+                logger.debug(
+                    f"DB lease extended for run {self.run_id} until {new_lease_expires_at} "
+                    f"(version={self.current_version})"
+                )
+            else:
+                logger.warning(
+                    f"DB lease extension failed for run {self.run_id} "
+                    f"(version conflict, lease_token mismatch, or status changed)"
+                )
 
         # 2. Extend SQS visibility timeout
         try:

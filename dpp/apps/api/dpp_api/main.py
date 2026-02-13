@@ -96,7 +96,7 @@ async def plan_violation_handler(request: Request, exc: PlanViolationError) -> J
     """Handle plan violation errors with RFC 9457 Problem Details format.
 
     Returns application/problem+json with plan-specific error details.
-    P1-8: Includes Retry-After header for 429 responses.
+    P1-2: Includes Retry-After header for 429 responses using exc.retry_after field.
     """
     problem = ProblemDetail(
         type=exc.error_type,
@@ -107,13 +107,9 @@ async def plan_violation_handler(request: Request, exc: PlanViolationError) -> J
     )
 
     headers = {}
-    # P1-8: Add Retry-After header for rate limit errors
-    if exc.status_code == 429 and "Retry after" in exc.detail:
-        # Extract TTL from detail message (format: "Retry after {ttl} seconds")
-        import re
-        match = re.search(r"Retry after (\d+) seconds", exc.detail)
-        if match:
-            headers["Retry-After"] = match.group(1)
+    # P1-2: Add Retry-After header using retry_after field (no regex parsing)
+    if exc.status_code == 429 and exc.retry_after is not None:
+        headers["Retry-After"] = str(exc.retry_after)
 
     return JSONResponse(
         status_code=exc.status_code,

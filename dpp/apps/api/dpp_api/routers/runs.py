@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from dpp_api.auth.api_key import AuthContext, get_auth_context
@@ -146,16 +147,19 @@ async def create_run(
     try:
         # INT-01: This will fail with UNIQUE constraint violation if race occurs
         repo.create(run)
-    except Exception as e:
-        # Check if it's a unique constraint violation (idempotency race)
-        if "uq_runs_tenant_idempotency" in str(e).lower() or "unique" in str(e).lower():
+    except IntegrityError as e:
+        # P1-3: Explicit IntegrityError handling for idempotency key conflicts
+        # Check if it's the idempotency key constraint violation
+        error_str = str(e.orig) if hasattr(e, 'orig') else str(e)
+
+        if "uq_runs_tenant_idempotency" in error_str.lower():
             # Race condition: Another request created the run first
             # Fetch the existing run
             existing_run = repo.get_by_idempotency_key(tenant_id, idempotency_key)
             if existing_run and existing_run.payload_hash == payload_hash:
                 # P1-9: Include trace_id in logs
                 logger.info(
-                    f"Race: Returning existing run {existing_run.run_id}",
+                    f"Idempotency race: Returning existing run {existing_run.run_id}",
                     extra={"trace_id": existing_run.trace_id} if existing_run.trace_id else {},
                 )
                 # P1-6: Add cost headers
@@ -165,11 +169,18 @@ async def create_run(
                     response.headers["X-DPP-Cost-Actual"] = format_usd_micros(existing_run.actual_cost_usd_micros)
                 return _build_receipt(existing_run)
             else:
+                # Hash mismatch - different payload with same key
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="Idempotency key conflict",
+                    detail="Idempotency key already used with different payload",
                 )
-        raise
+        else:
+            # Other integrity error (e.g., foreign key, check constraint)
+            logger.error(f"IntegrityError during run creation: {error_str}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database constraint violation",
+            )
 
     # Reserve budget (DEC-4203)
     redis_client = RedisClient.get_client()

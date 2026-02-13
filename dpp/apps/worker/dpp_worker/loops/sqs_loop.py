@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 import boto3
 import redis
@@ -44,6 +44,7 @@ class WorkerLoop:
         sqs_client: Any,
         s3_client: Any,
         db_session: Session,
+        session_factory: Callable[[], Session],
         budget_manager: BudgetManager,
         queue_url: str,
         result_bucket: str,
@@ -55,7 +56,8 @@ class WorkerLoop:
         Args:
             sqs_client: boto3 SQS client
             s3_client: boto3 S3 client
-            db_session: Database session
+            db_session: Database session (main thread)
+            session_factory: SessionLocal factory for creating thread-safe sessions (P0-1)
             budget_manager: Budget manager instance
             queue_url: SQS queue URL
             result_bucket: S3 bucket for results
@@ -65,6 +67,7 @@ class WorkerLoop:
         self.sqs = sqs_client
         self.s3 = s3_client
         self.db = db_session
+        self.session_factory = session_factory
         self.budget_manager = budget_manager
         self.queue_url = queue_url
         self.result_bucket = result_bucket
@@ -98,19 +101,26 @@ class WorkerLoop:
             body = json.loads(message["Body"])
 
             try:
-                self._process_message(body, receipt_handle)
-                # Success - delete message
-                self.sqs.delete_message(
-                    QueueUrl=self.queue_url, ReceiptHandle=receipt_handle
-                )
-                logger.info(f"Message processed and deleted: {body.get('run_id')}")
+                # P0-1: _process_message returns bool (True=delete ok, False=no delete)
+                should_delete = self._process_message(body, receipt_handle)
+                if should_delete:
+                    # Success - delete message
+                    self.sqs.delete_message(
+                        QueueUrl=self.queue_url, ReceiptHandle=receipt_handle
+                    )
+                    logger.info(f"Message processed and deleted: {body.get('run_id')}")
+                else:
+                    logger.warning(
+                        f"Message processing incomplete (claim failed) - "
+                        f"message will be retried: {body.get('run_id')}"
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to process message: {e}", exc_info=True)
                 # Message will become visible again after visibility timeout
                 # or go to DLQ after max receives
 
-    def _process_message(self, message: dict[str, Any], receipt_handle: str) -> None:
+    def _process_message(self, message: dict[str, Any], receipt_handle: str) -> bool:
         """Process a single SQS message.
 
         Args:
@@ -123,6 +133,10 @@ class WorkerLoop:
                     "schema_version": "1"
                 }
             receipt_handle: SQS message receipt handle for heartbeat
+
+        Returns:
+            True if message should be deleted (success or permanent failure)
+            False if message should NOT be deleted (claim failed - can retry)
         """
         run_id = message["run_id"]
         tenant_id = message["tenant_id"]
@@ -134,11 +148,11 @@ class WorkerLoop:
         run = self.repo.get_by_id(run_id, tenant_id)
         if not run:
             logger.error(f"Run {run_id} not found")
-            return
+            return True  # Permanent error - delete message
 
         if run.status != "QUEUED":
             logger.warning(f"Run {run_id} status is {run.status}, expected QUEUED (skip)")
-            return
+            return True  # Already processed or failed - delete message
 
         # 2. QUEUED -> PROCESSING (DB-CAS + lease)
         lease_token = str(uuid.uuid4())
@@ -164,7 +178,7 @@ class WorkerLoop:
 
         if not processing_success:
             logger.warning(f"Run {run_id} already processing (0 rows affected) - skip")
-            return
+            return True  # Another worker claimed it - delete message
 
         # Step 4 (Spec 9.1): Redis lease:{run_id} SETNX TTL=120 (DEC-4205)
         if self.redis:
@@ -174,6 +188,7 @@ class WorkerLoop:
         logger.info(f"Run {run_id} transitioned to PROCESSING with lease {lease_token}")
 
         # P0-D: Start heartbeat thread to prevent zombie detection
+        # P0-1: Pass session_factory instead of db_session for thread-safety
         # Version after PROCESSING transition is current_version + 1
         processing_version = current_version + 1
         heartbeat = HeartbeatThread(
@@ -181,7 +196,7 @@ class WorkerLoop:
             tenant_id=tenant_id,
             lease_token=lease_token,
             current_version=processing_version,
-            db_session=self.db,
+            session_factory=self.session_factory,
             sqs_client=self.sqs,
             queue_url=self.queue_url,
             receipt_handle=receipt_handle,
@@ -224,6 +239,10 @@ class WorkerLoop:
 
             # 5. PHASE 1: CLAIM (P0-2: Claim-Check pattern)
             # CRITICAL: Claim BEFORE any side-effects (S3 upload)
+            # P0-1: Stop heartbeat BEFORE finalize to prevent version conflict
+            heartbeat.stop()
+            logger.debug(f"Heartbeat stopped before finalize for run {run_id}")
+
             try:
                 finalize_token, claimed_version = claim_finalize(
                     run_id=run_id,
@@ -235,11 +254,10 @@ class WorkerLoop:
 
             except ClaimError as e:
                 logger.warning(f"Run {run_id} claim failed (LOSER): {e}")
-                # P0-D: Stop heartbeat on claim failure
-                heartbeat.stop()
-                # Another worker or reaper already finalized - this is OK
+                # P0-1: Another worker or reaper already finalized - this is OK
                 # Do NOT upload to S3 since we lost the race
-                return
+                # Do NOT delete SQS message - allow retry in case of transient issue
+                return False
 
             # 6. PHASE 2: S3 UPLOAD (only after successful claim)
             # Key: dpp/{tenant_id}/{yyyy}/{mm}/{dd}/{run_id}/pack_envelope.json
@@ -294,19 +312,21 @@ class WorkerLoop:
                 else:
                     logger.warning(f"Run {run_id} finalize commit returned unexpected result")
 
-                # P0-D: Stop heartbeat on success
-                heartbeat.stop()
+                # P0-1: Success - delete message
+                return True
 
             except FinalizeError as e:
                 logger.error(f"Run {run_id} commit failed after claim and S3 upload: {e}")
-                # P0-D: Stop heartbeat on error
-                heartbeat.stop()
                 # This is a problem - claim succeeded, S3 uploaded, but commit failed
                 # Reconciliation job will handle this
                 raise
 
         except Exception as e:
             logger.error(f"Run {run_id} execution failed: {e}", exc_info=True)
+
+            # P0-1: Stop heartbeat before failure finalize
+            heartbeat.stop()
+            logger.debug(f"Heartbeat stopped before failure finalize for run {run_id}")
 
             # 7. 2-phase finalize (FAILURE)
             try:
@@ -326,19 +346,17 @@ class WorkerLoop:
                 else:
                     logger.warning(f"Run {run_id} failure finalize lost race (LOSER)")
 
-                # P0-D: Stop heartbeat after failure finalize
-                heartbeat.stop()
+                # P0-1: Failure finalized - delete message
+                return True
 
             except ClaimError as e:
                 logger.warning(f"Run {run_id} failure claim failed (LOSER): {e}")
-                # P0-D: Stop heartbeat on claim error
-                heartbeat.stop()
-                return
+                # P0-1: Another worker finalized - don't delete message, allow retry
+                return False
 
             except FinalizeError as e:
                 logger.error(f"Run {run_id} failure finalize failed after claim: {e}")
-                # P0-D: Stop heartbeat on finalize error
-                heartbeat.stop()
+                # Claim succeeded but finalize failed - raise to avoid deleting message
                 raise
 
     def run_forever(self) -> None:

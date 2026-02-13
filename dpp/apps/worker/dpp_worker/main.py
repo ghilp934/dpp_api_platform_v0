@@ -39,21 +39,33 @@ def main() -> None:
     sqs_endpoint = os.getenv("SQS_ENDPOINT_URL", "http://localhost:4566")
     s3_endpoint = os.getenv("S3_ENDPOINT_URL", "http://localhost:4566")
 
-    sqs_client = boto3.client(
-        "sqs",
-        endpoint_url=sqs_endpoint,
-        region_name="us-east-1",
-        aws_access_key_id="test",
-        aws_secret_access_key="test",
-    )
+    # P0-2: Only use test credentials for LocalStack
+    # Production uses boto3 default credential chain (IAM roles, env vars, etc.)
+    def is_localstack(endpoint: str | None) -> bool:
+        """Check if endpoint is LocalStack."""
+        return endpoint is not None and ("localhost" in endpoint or "127.0.0.1" in endpoint)
 
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=s3_endpoint,
-        region_name="us-east-1",
-        aws_access_key_id="test",
-        aws_secret_access_key="test",
-    )
+    sqs_kwargs = {
+        "endpoint_url": sqs_endpoint,
+        "region_name": "us-east-1",
+    }
+    if is_localstack(sqs_endpoint):
+        sqs_kwargs["aws_access_key_id"] = "test"
+        sqs_kwargs["aws_secret_access_key"] = "test"
+        logger.info("Using LocalStack test credentials for SQS")
+
+    sqs_client = boto3.client("sqs", **sqs_kwargs)
+
+    s3_kwargs = {
+        "endpoint_url": s3_endpoint,
+        "region_name": "us-east-1",
+    }
+    if is_localstack(s3_endpoint):
+        s3_kwargs["aws_access_key_id"] = "test"
+        s3_kwargs["aws_secret_access_key"] = "test"
+        logger.info("Using LocalStack test credentials for S3")
+
+    s3_client = boto3.client("s3", **s3_kwargs)
 
     # Database
     engine = create_engine(database_url, echo=False)
@@ -67,10 +79,12 @@ def main() -> None:
     budget_manager = BudgetManager(redis_client, db_session)
 
     # Worker loop
+    # P0-1: Pass session_factory for HeartbeatThread thread-safety
     worker = WorkerLoop(
         sqs_client=sqs_client,
         s3_client=s3_client,
         db_session=db_session,
+        session_factory=SessionLocal,
         budget_manager=budget_manager,
         queue_url=sqs_queue_url,
         result_bucket=s3_result_bucket,

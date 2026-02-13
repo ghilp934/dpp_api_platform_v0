@@ -27,6 +27,7 @@ class PlanViolationError(Exception):
         error_type: RFC 9457 type URI
         title: Short error title
         detail: Detailed error message
+        retry_after: Seconds to wait before retry (for 429 errors, optional)
     """
 
     def __init__(
@@ -35,11 +36,13 @@ class PlanViolationError(Exception):
         error_type: str,
         title: str,
         detail: str,
+        retry_after: int | None = None,
     ):
         self.status_code = status_code
         self.error_type = error_type
         self.title = title
         self.detail = detail
+        self.retry_after = retry_after
         super().__init__(detail)
 
 
@@ -148,7 +151,8 @@ class PlanEnforcer:
     def check_rate_limit_post(self, plan: Plan, tenant_id: str) -> None:
         """Check rate limit for POST /runs using Redis.
 
-        Uses Redis with TTL to track POST requests per minute.
+        P1-1: Atomic rate limiting using INCR-first pattern.
+        Uses INCR → check → EXPIRE to avoid race conditions.
 
         Args:
             plan: Active Plan object
@@ -167,37 +171,32 @@ class PlanEnforcer:
         # Redis key for rate limiting
         rate_key = f"rate_limit:post_runs:{tenant_id}"
 
-        # Get current count
-        current_count = self.redis.get(rate_key)
+        # P1-1: INCR first (atomic) - returns value AFTER increment
+        new_count = self.redis.incr(rate_key)
 
-        if current_count is None:
-            # First request in this window
-            # INCR + EXPIRE in pipeline for atomicity
-            pipe = self.redis.pipeline()
-            pipe.incr(rate_key)
-            pipe.expire(rate_key, 60)  # 60 seconds TTL
-            pipe.execute()
-            return
+        # If this is the first request, set TTL
+        if new_count == 1:
+            self.redis.expire(rate_key, 60)  # 60 seconds TTL
 
-        current_count = int(current_count)
-
-        if current_count >= rate_limit_post_per_min:
-            # Rate limit exceeded
+        # Check if limit exceeded
+        if new_count > rate_limit_post_per_min:
+            # Rate limit exceeded - decrement to rollback
+            self.redis.decr(rate_key)
             ttl = self.redis.ttl(rate_key)
+            # P1-2: Include retry_after field for 429 errors
             raise PlanViolationError(
                 status_code=429,
                 error_type="https://api.dpp.example/problems/rate-limit-exceeded",
                 title="Rate Limit Exceeded",
                 detail=f"Rate limit of {rate_limit_post_per_min} POST /runs per minute exceeded. "
                 f"Retry after {ttl} seconds.",
+                retry_after=max(1, ttl) if ttl > 0 else 60,
             )
-
-        # Increment count
-        self.redis.incr(rate_key)
 
     def check_rate_limit_poll(self, plan: Plan, tenant_id: str) -> None:
         """Check rate limit for GET /runs/{id} polling using Redis.
 
+        P1-1: Atomic rate limiting using INCR-first pattern.
         P1-8: Rate limiting for GET endpoints to prevent excessive polling.
 
         Args:
@@ -217,32 +216,27 @@ class PlanEnforcer:
         # Redis key for rate limiting
         rate_key = f"rate_limit:poll_runs:{tenant_id}"
 
-        # Get current count
-        current_count = self.redis.get(rate_key)
+        # P1-1: INCR first (atomic) - returns value AFTER increment
+        new_count = self.redis.incr(rate_key)
 
-        if current_count is None:
-            # First request in this window
-            pipe = self.redis.pipeline()
-            pipe.incr(rate_key)
-            pipe.expire(rate_key, 60)  # 60 seconds TTL
-            pipe.execute()
-            return
+        # If this is the first request, set TTL
+        if new_count == 1:
+            self.redis.expire(rate_key, 60)  # 60 seconds TTL
 
-        current_count = int(current_count)
-
-        if current_count >= rate_limit_poll_per_min:
-            # Rate limit exceeded
+        # Check if limit exceeded
+        if new_count > rate_limit_poll_per_min:
+            # Rate limit exceeded - decrement to rollback
+            self.redis.decr(rate_key)
             ttl = self.redis.ttl(rate_key)
+            # P1-2: Include retry_after field for 429 errors
             raise PlanViolationError(
                 status_code=429,
                 error_type="https://api.dpp.example/problems/rate-limit-exceeded",
                 title="Rate Limit Exceeded",
                 detail=f"Rate limit of {rate_limit_poll_per_min} GET /runs polling per minute exceeded. "
                 f"Retry after {ttl} seconds.",
+                retry_after=max(1, ttl) if ttl > 0 else 60,
             )
-
-        # Increment count
-        self.redis.incr(rate_key)
 
     def get_rate_limit_headers_post(self, plan: Plan, tenant_id: str) -> dict[str, str]:
         """Get rate limit headers for POST /runs endpoint.

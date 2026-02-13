@@ -16,13 +16,19 @@ class SQSClient:
         sqs_endpoint = os.getenv("SQS_ENDPOINT_URL", "http://localhost:4566")
         self.queue_url = os.getenv("SQS_QUEUE_URL", "http://localhost:4566/000000000000/dpp-runs")
 
-        self.client = boto3.client(
-            "sqs",
-            endpoint_url=sqs_endpoint,
-            region_name="us-east-1",
-            aws_access_key_id="test",
-            aws_secret_access_key="test",
-        )
+        # P0-2: Only use test credentials for LocalStack
+        # Production uses boto3 default credential chain (IAM roles, env vars, etc.)
+        sqs_kwargs = {
+            "endpoint_url": sqs_endpoint,
+            "region_name": "us-east-1",
+        }
+
+        # Check if endpoint is LocalStack (localhost or 127.0.0.1)
+        if sqs_endpoint and ("localhost" in sqs_endpoint or "127.0.0.1" in sqs_endpoint):
+            sqs_kwargs["aws_access_key_id"] = "test"
+            sqs_kwargs["aws_secret_access_key"] = "test"
+
+        self.client = boto3.client("sqs", **sqs_kwargs)
 
     def enqueue_run(self, run_id: str, tenant_id: str, pack_type: str, trace_id: str | None = None) -> str:
         """
