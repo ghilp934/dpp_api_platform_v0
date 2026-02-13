@@ -492,3 +492,66 @@ def test_full_reserve_refund_flow(
     )
     assert summary["money_state"] == "REFUNDED"
     assert summary["actual_cost_usd_micros"] == minimum_fee
+
+
+def test_settle_overcharge_attempt(budget_scripts: BudgetScripts):
+    """
+    CRITICAL: Test that Settle.lua caps charge at reserved amount.
+
+    This prevents an attacker from charging more than the reservation,
+    which could drain user balance into negative.
+    """
+    tenant_id = "tenant_overcharge"
+    run_id = str(uuid.uuid4())
+
+    # Set balance to $5.00
+    budget_scripts.set_balance(tenant_id, 5_000_000)
+
+    # Reserve $2.00
+    status, _ = budget_scripts.reserve(tenant_id, run_id, 2_000_000)
+    assert status == "OK"
+
+    # ATTACK: Try to charge $100.00 (way more than reserved)
+    status, charge, refund, new_balance = budget_scripts.settle(
+        tenant_id, run_id, 100_000_000  # $100.00 attack!
+    )
+
+    assert status == "OK"
+    # CRITICAL: Charge should be capped at reserved amount ($2.00)
+    assert charge == 2_000_000  # Not $100!
+    assert refund == 0  # No refund (all reserved was used)
+    assert new_balance == 3_000_000  # $5.00 - $2.00 = $3.00
+
+    # Verify balance is correct (not negative!)
+    final_balance = budget_scripts.get_balance(tenant_id)
+    assert final_balance == 3_000_000
+    assert final_balance >= 0  # NEVER negative
+
+
+def test_settle_negative_charge_attempt(budget_scripts: BudgetScripts):
+    """
+    CRITICAL: Test that Settle.lua rejects negative charge.
+
+    This prevents an attacker from using negative charge to add money.
+    """
+    tenant_id = "tenant_negative"
+    run_id = str(uuid.uuid4())
+
+    # Set balance to $5.00
+    budget_scripts.set_balance(tenant_id, 5_000_000)
+
+    # Reserve $2.00
+    budget_scripts.reserve(tenant_id, run_id, 2_000_000)
+
+    # ATTACK: Try to charge -$1.00 (negative!)
+    status, charge, refund, new_balance = budget_scripts.settle(
+        tenant_id, run_id, -1_000_000  # Negative attack!
+    )
+
+    assert status == "OK"
+    # CRITICAL: Negative charge should be treated as 0
+    assert charge == 0
+    assert refund == 2_000_000  # Full refund (no charge)
+    # Balance should be $5.00 + $2.00 refund = $7.00? No!
+    # Actually it should just return the reserved amount
+    assert new_balance == 5_000_000  # Back to original

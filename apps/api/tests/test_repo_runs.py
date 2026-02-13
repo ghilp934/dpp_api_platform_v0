@@ -232,3 +232,65 @@ def test_list_expired_leases(run_repo: RunRepository, db_session: Session):
 
     assert len(expired) == 1
     assert expired[0].run_id == expired_run.run_id
+
+
+def test_update_run_version_conflict(run_repo: RunRepository, sample_run: Run):
+    """
+    CRITICAL: Explicit version conflict test (DEC-4210).
+
+    Tests that update_with_version_check properly rejects updates
+    when expected_version doesn't match current version.
+
+    This is the core mechanism that prevents race conditions and
+    ensures only one concurrent operation can succeed.
+    """
+    # Initial state: version = 0
+    initial = run_repo.get_by_id(sample_run.run_id, sample_run.tenant_id)
+    assert initial.version == 0
+    assert initial.status == "QUEUED"
+
+    # Simulate winner: Update with correct version
+    winner_success = run_repo.update_with_version_check(
+        run_id=sample_run.run_id,
+        tenant_id=sample_run.tenant_id,
+        expected_version=0,
+        updates={"status": "PROCESSING", "money_state": "RESERVED"},
+    )
+    assert winner_success is True, "Winner should succeed"
+
+    # Verify winner's update
+    after_winner = run_repo.get_by_id(sample_run.run_id, sample_run.tenant_id)
+    assert after_winner.version == 1, "Version should be incremented"
+    assert after_winner.status == "PROCESSING"
+    assert after_winner.money_state == "RESERVED"
+
+    # ATTACK: Simulate loser using stale version
+    loser_success = run_repo.update_with_version_check(
+        run_id=sample_run.run_id,
+        tenant_id=sample_run.tenant_id,
+        expected_version=0,  # Stale! Current version is 1
+        updates={"status": "FAILED", "money_state": "REFUNDED"},
+    )
+
+    # CRITICAL: Loser MUST be rejected
+    assert loser_success is False, "Loser with stale version must be rejected"
+
+    # Verify loser's update was NOT applied
+    final = run_repo.get_by_id(sample_run.run_id, sample_run.tenant_id)
+    assert final.version == 1, "Version should still be 1 (not incremented by loser)"
+    assert final.status == "PROCESSING", "Status should not change to FAILED"
+    assert final.money_state == "RESERVED", "Money state should not change to REFUNDED"
+
+    # Additional verification: Winner can continue with correct version
+    second_winner_success = run_repo.update_with_version_check(
+        run_id=sample_run.run_id,
+        tenant_id=sample_run.tenant_id,
+        expected_version=1,  # Correct current version
+        updates={"status": "COMPLETED", "money_state": "SETTLED"},
+    )
+    assert second_winner_success is True, "Update with correct version should succeed"
+
+    final_state = run_repo.get_by_id(sample_run.run_id, sample_run.tenant_id)
+    assert final_state.version == 2
+    assert final_state.status == "COMPLETED"
+    assert final_state.money_state == "SETTLED"

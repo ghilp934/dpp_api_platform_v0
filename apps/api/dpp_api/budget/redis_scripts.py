@@ -41,6 +41,7 @@ return {"OK", tostring(bal - reserved)}
 """
 
 # Settle.lua - Settle reservation and return refund
+# CRITICAL: Prevents overcharge attacks and negative balance
 SETTLE_LUA = """
 local budget_key = KEYS[1]
 local reserve_key = KEYS[2]
@@ -51,13 +52,27 @@ if redis.call("EXISTS", reserve_key) ~= 1 then
 end
 
 local reserved = tonumber(redis.call("HGET", reserve_key, "reserved_usd_micros") or "0")
+
+-- CRITICAL: Prevent negative charge (attack vector)
+if charge < 0 then
+  charge = 0
+end
+
+-- CRITICAL: Cap charge at reserved amount (prevent overcharge)
 if charge > reserved then
   charge = reserved
 end
+
 local refund = reserved - charge
 
 local bal = tonumber(redis.call("GET", budget_key) or "0")
 bal = bal + refund
+
+-- CRITICAL: Final sanity check - balance should never go negative
+if bal < 0 then
+  bal = 0
+end
+
 redis.call("SET", budget_key, tostring(bal))
 redis.call("DEL", reserve_key)
 return {"OK", tostring(charge), tostring(refund), tostring(bal)}
