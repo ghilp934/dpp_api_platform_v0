@@ -13,13 +13,13 @@
 |-----------|--------|-------|-------------|
 | MS-0 | ✅ **DONE** | 6/6 | Repository Bootstrap |
 | MS-1 | ✅ **DONE** | 22/22 | DB + AuthZ Foundation |
-| MS-2 | 🔲 TODO | 0/? | Budget Engine |
+| MS-2 | ✅ **DONE** | 28/28 | Budget Engine |
 | MS-3 | 🔲 TODO | 0/? | API Endpoints |
 | MS-4 | 🔲 TODO | 0/? | Worker |
 | MS-5 | 🔲 TODO | 0/? | Reaper |
 | MS-6 | 🔲 TODO | 0/? | Hardening + Production Readiness |
 
-**Overall Completion**: 2/7 milestones (28.6%)
+**Overall Completion**: 3/7 milestones (42.9%)
 
 ---
 
@@ -81,49 +81,46 @@
 
 ---
 
-## 🔲 Upcoming Milestones
-
 ### MS-2: Budget Engine
 
-**Status**: 🔲 TODO
-**Priority**: HIGH
-**Estimated Effort**: 2-3 days
+**Status**: ✅ Complete
+**Completion Date**: 2026-02-13
+**Tests**: 28/28 passing (100%)
 
-#### Objectives
-Implement reserve-then-settle budget management with DEC-4211 money type conversions.
+#### Deliverables
+- [x] Money utilities with DEC-4211 compliance
+- [x] BudgetManager with reserve-then-settle pattern
+- [x] Comprehensive unit tests (28 tests)
+- [x] No float/double in money calculations
 
-#### Tasks
-- [ ] **Money Utilities** (`apps/api/dpp_api/utils/money.py`)
-  - [ ] `usd_micros_to_decimal(micros: int) -> Decimal`
-  - [ ] `decimal_to_usd_micros(amount: Decimal) -> int`
-  - [ ] 4dp string formatting for API responses
-  - [ ] Validation: no negative amounts, max $10,000 per request
+#### Technical Achievements
+- **Money Utilities** (`apps/api/dpp_api/utils/money.py`)
+  - [x] `usd_micros_to_decimal()` - Convert BIGINT to Decimal (4dp)
+  - [x] `decimal_to_usd_micros()` - Convert Decimal to BIGINT
+  - [x] `format_usd_micros()` - Format as "1.5000" string for API
+  - [x] `parse_usd_string()` - Parse API string to USD_MICROS
+  - [x] `validate_usd_micros()` - Range validation ($0 - $10,000)
+  - [x] Uses `Decimal` for precision, no float/double
+  - [x] 14 money utility tests passing
 
-- [ ] **BudgetManager** (`apps/api/dpp_api/budget/manager.py`)
-  - [ ] `reserve(run_id, max_cost_usd_micros) -> bool`
-    - Validate budget available
-    - Set `money_state = RESERVED`
-    - Record `reservation_max_cost_usd_micros`
-  - [ ] `settle(run_id, actual_cost_usd_micros) -> bool`
-    - Verify `money_state = RESERVED`
-    - Set `actual_cost_usd_micros`
-    - Set `money_state = SETTLED`
-  - [ ] `refund(run_id, minimum_fee_usd_micros) -> bool`
-    - On failure: charge minimum fee only
-    - Set `money_state = REFUNDED`
+- **BudgetManager** (`apps/api/dpp_api/budget/manager.py`)
+  - [x] `reserve()` - Lock maximum budget (NONE → RESERVED)
+  - [x] `settle()` - Charge actual cost (RESERVED → SETTLED)
+  - [x] `refund()` - Charge minimum fee on failure (RESERVED → REFUNDED)
+  - [x] `get_budget_summary()` - Get current budget state
+  - [x] DEC-4210 optimistic locking integrated
+  - [x] State machine validation enforced
+  - [x] 14 budget manager tests passing
 
-- [ ] **Tests** (`tests/test_budget.py`)
-  - [ ] Money conversion accuracy tests
-  - [ ] Reserve → Settle happy path
-  - [ ] Reserve → Refund failure path
-  - [ ] Budget validation edge cases
-  - [ ] Concurrent reservation race conditions
+#### Key Files
+- `apps/api/dpp_api/utils/money.py` - Money conversion utilities
+- `apps/api/dpp_api/budget/manager.py` - Budget management
+- `tests/test_money.py` - Money utility tests (14 tests)
+- `tests/test_budget.py` - Budget manager tests (14 tests)
 
-#### Success Criteria
-- ✅ All money conversions accurate to 4 decimal places
-- ✅ No float/double used in calculations
-- ✅ 15+ unit tests passing
-- ✅ Budget state machine enforced (NONE → RESERVED → SETTLED/REFUNDED)
+---
+
+## 🔲 Upcoming Milestones
 
 ---
 
