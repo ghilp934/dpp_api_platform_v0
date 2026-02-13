@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import boto3
+import redis
 from sqlalchemy.orm import Session
 
 from dpp_api.budget import BudgetManager
@@ -43,6 +44,7 @@ class WorkerLoop:
         budget_manager: BudgetManager,
         queue_url: str,
         result_bucket: str,
+        redis_client: redis.Redis | None = None,
         lease_ttl_sec: int = 120,
     ):
         """Initialize worker loop.
@@ -54,6 +56,7 @@ class WorkerLoop:
             budget_manager: Budget manager instance
             queue_url: SQS queue URL
             result_bucket: S3 bucket for results
+            redis_client: Redis client for lease management (DEC-4205)
             lease_ttl_sec: Lease TTL in seconds (default 120)
         """
         self.sqs = sqs_client
@@ -62,6 +65,7 @@ class WorkerLoop:
         self.budget_manager = budget_manager
         self.queue_url = queue_url
         self.result_bucket = result_bucket
+        self.redis = redis_client
         self.lease_ttl_sec = lease_ttl_sec
         self.repo = RunRepository(db_session)
 
@@ -139,6 +143,7 @@ class WorkerLoop:
         )
         current_version = run.version
 
+        # WKR-01: Strict state transition with extra_conditions
         processing_success = self.repo.update_with_version_check(
             run_id=run_id,
             tenant_id=tenant_id,
@@ -148,11 +153,19 @@ class WorkerLoop:
                 "lease_token": lease_token,
                 "lease_expires_at": lease_expires_at,
             },
+            extra_conditions={
+                "status": "QUEUED",  # Ensure we're transitioning from QUEUED
+            },
         )
 
         if not processing_success:
             logger.warning(f"Run {run_id} already processing (0 rows affected) - skip")
             return
+
+        # Step 4 (Spec 9.1): Redis lease:{run_id} SETNX TTL=120 (DEC-4205)
+        if self.redis:
+            lease_key = f"lease:{run_id}"
+            self.redis.set(lease_key, lease_token, ex=self.lease_ttl_sec, nx=True)
 
         logger.info(f"Run {run_id} transitioned to PROCESSING with lease {lease_token}")
 

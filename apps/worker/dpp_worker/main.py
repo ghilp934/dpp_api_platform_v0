@@ -25,10 +25,15 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     """Main entry point for worker."""
-    # Configuration from environment
-    database_url = os.getenv(
-        "DATABASE_URL", "postgresql://dpp_user:dpp_pass@localhost:5432/dpp_db"
-    )
+    # ENV-01: Configuration from environment with fail-fast
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        # Default to docker-compose configuration (ENV-01: unified to 'dpp')
+        database_url = "postgresql://dpp_user:dpp_pass@localhost:5432/dpp"
+        logger.warning(
+            "DATABASE_URL not set, using default: %s",
+            database_url.replace("dpp_pass", "***"),
+        )
     sqs_queue_url = os.getenv("SQS_QUEUE_URL", "http://localhost:4566/000000000000/dpp-runs")
     s3_result_bucket = os.getenv("S3_RESULT_BUCKET", "dpp-results")
 
@@ -71,6 +76,7 @@ def main() -> None:
         budget_manager=budget_manager,
         queue_url=sqs_queue_url,
         result_bucket=s3_result_bucket,
+        redis_client=redis_client,
         lease_ttl_sec=120,
     )
 

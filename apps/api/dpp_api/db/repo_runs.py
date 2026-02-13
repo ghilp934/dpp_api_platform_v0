@@ -68,6 +68,7 @@ class RunRepository:
         tenant_id: str,
         expected_version: int,
         updates: dict,
+        extra_conditions: dict | None = None,
     ) -> bool:
         """
         Update run with optimistic locking (DEC-4210).
@@ -77,6 +78,8 @@ class RunRepository:
             tenant_id: Tenant ID for ownership verification
             expected_version: Expected version for optimistic locking
             updates: Dictionary of fields to update
+            extra_conditions: Additional WHERE conditions (column_name: value).
+                Use value=None to add "IS NULL" condition.
 
         Returns:
             True if update succeeded (1 row affected), False if version mismatch (0 rows)
@@ -86,15 +89,22 @@ class RunRepository:
         updates["updated_at"] = datetime.now(timezone.utc)
 
         # Build UPDATE with WHERE version=expected_version
-        stmt = (
-            update(Run)
-            .where(
-                Run.run_id == run_id,
-                Run.tenant_id == tenant_id,
-                Run.version == expected_version,
-            )
-            .values(**updates)
-        )
+        where_clauses = [
+            Run.run_id == run_id,
+            Run.tenant_id == tenant_id,
+            Run.version == expected_version,
+        ]
+
+        # Add extra conditions for defense-in-depth (DEC-4210 spec compliance)
+        if extra_conditions:
+            for col_name, expected_val in extra_conditions.items():
+                col = getattr(Run, col_name)
+                if expected_val is None:
+                    where_clauses.append(col.is_(None))
+                else:
+                    where_clauses.append(col == expected_val)
+
+        stmt = update(Run).where(*where_clauses).values(**updates)
 
         result = self.db.execute(stmt)
         self.db.commit()

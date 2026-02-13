@@ -58,7 +58,7 @@ def create_pack_envelope(
         },
     }
 
-    # Canonical JSON (keys sorted, no whitespace)
+    # Pretty-printed JSON for S3 storage (human-readable)
     envelope_json = json.dumps(envelope, indent=2, ensure_ascii=False)
 
     return envelope_json

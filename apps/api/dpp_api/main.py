@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from dpp_api.routers import health
+from dpp_api.routers import health, runs
 
 app = FastAPI(
     title="DPP API",
@@ -24,6 +24,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(health.router, tags=["health"])
+app.include_router(runs.router)  # API-01: Runs endpoints
 
 
 @app.get("/")

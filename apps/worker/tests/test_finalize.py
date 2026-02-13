@@ -4,8 +4,8 @@ import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 import pytest
+import redis
 from sqlalchemy.orm import Session
 
 # Add API path for imports
@@ -64,7 +64,7 @@ def create_processing_run(
 
 
 def test_finalize_success_winner(
-    db_session: Session, redis_client: Any, budget_manager: BudgetManager
+    db_session: Session, redis_client: redis.Redis, budget_manager: BudgetManager
 ):
     """Test successful finalize (winner)."""
     run, lease_token = create_processing_run(db_session, budget_manager)
@@ -102,7 +102,7 @@ def test_finalize_success_winner(
 
 
 def test_finalize_success_loser(
-    db_session: Session, redis_client: Any, budget_manager: BudgetManager
+    db_session: Session, redis_client: redis.Redis, budget_manager: BudgetManager
 ):
     """Test finalize when another process already claimed (loser)."""
     run, lease_token = create_processing_run(db_session, budget_manager)
@@ -146,7 +146,7 @@ def test_finalize_success_loser(
 
 
 def test_finalize_failure_winner(
-    db_session: Session, redis_client: Any, budget_manager: BudgetManager
+    db_session: Session, redis_client: redis.Redis, budget_manager: BudgetManager
 ):
     """Test finalize for failed run."""
     run, lease_token = create_processing_run(db_session, budget_manager)
@@ -177,7 +177,7 @@ def test_finalize_failure_winner(
 
 
 def test_finalize_prevents_overcharge(
-    db_session: Session, redis_client: Any, budget_manager: BudgetManager
+    db_session: Session, redis_client: redis.Redis, budget_manager: BudgetManager
 ):
     """Test that finalize rejects actual_cost > reserved (DEC-4211)."""
     run, lease_token = create_processing_run(db_session, budget_manager, 1_000_000)
@@ -196,5 +196,67 @@ def test_finalize_prevents_overcharge(
         )
 
 
-# Note: Need to import 'Any' from typing
-from typing import Any
+def test_finalize_rejects_invalid_money_state(
+    db_session: Session, redis_client: redis.Redis, budget_manager: BudgetManager
+):
+    """Test that finalize rejects run with money_state != RESERVED (Golden Rule)."""
+    tenant_id = f"tenant_{uuid.uuid4().hex[:8]}"
+    run_id = str(uuid.uuid4())
+    lease_token = str(uuid.uuid4())
+
+    budget_manager.set_balance(tenant_id, 10_000_000)
+
+    # Create run with money_state=NONE (invalid for finalize)
+    run = Run(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        pack_type="decision",
+        profile_version="v0.4.2.2",
+        status="PROCESSING",
+        money_state="NONE",  # Invalid! Should be RESERVED
+        payload_hash="test_hash",
+        version=1,
+        reservation_max_cost_usd_micros=1_000_000,
+        minimum_fee_usd_micros=50_000,
+        retention_until=datetime.now(timezone.utc) + timedelta(days=7),
+        lease_token=lease_token,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
+    )
+
+    repo = RunRepository(db_session)
+    repo.create(run)
+
+    with pytest.raises(FinalizeError, match="money_state"):
+        finalize_success(
+            run_id=run.run_id,
+            tenant_id=run.tenant_id,
+            lease_token=lease_token,
+            actual_cost_usd_micros=500_000,
+            result_bucket="dpp-results",
+            result_key="test/key",
+            result_sha256="abc123",
+            db=db_session,
+            budget_manager=budget_manager,
+        )
+
+
+def test_finalize_wrong_lease_token_fails(
+    db_session: Session, redis_client: redis.Redis, budget_manager: BudgetManager
+):
+    """Test that finalize with wrong lease_token fails claim (DEC-4210 defense-in-depth)."""
+    run, correct_lease_token = create_processing_run(db_session, budget_manager)
+
+    wrong_lease_token = str(uuid.uuid4())
+
+    with pytest.raises(ClaimError):
+        finalize_success(
+            run_id=run.run_id,
+            tenant_id=run.tenant_id,
+            lease_token=wrong_lease_token,  # Wrong token!
+            actual_cost_usd_micros=500_000,
+            result_bucket="dpp-results",
+            result_key="test/key",
+            result_sha256="abc123",
+            db=db_session,
+            budget_manager=budget_manager,
+        )

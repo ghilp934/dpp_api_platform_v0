@@ -1,12 +1,15 @@
 """Database session management."""
 
+import os
 from typing import Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-# Database URL (should be from config/env in production)
-DATABASE_URL = "postgresql://dpp_user:dpp_pass@localhost:5432/dpp"
+# ENV-01: Database URL from environment with fallback to docker-compose default
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql://dpp_user:dpp_pass@localhost:5432/dpp"
+)
 
 # Create engine
 engine = create_engine(

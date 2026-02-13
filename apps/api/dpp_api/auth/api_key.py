@@ -1,6 +1,7 @@
 """API Key authentication for DPP."""
 
 import hashlib
+import hmac
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -112,9 +113,9 @@ async def get_auth_context(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Verify key hash
+    # Verify key hash (SEC-01: Use constant-time comparison to prevent timing attacks)
     provided_hash = hash_api_key(api_key)
-    if provided_hash != db_api_key.key_hash:
+    if not hmac.compare_digest(provided_hash, db_api_key.key_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",

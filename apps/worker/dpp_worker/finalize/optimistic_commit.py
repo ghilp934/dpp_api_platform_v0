@@ -4,11 +4,24 @@ Implements exactly-once terminal transition to prevent double-settlement and rac
 between Worker and Reaper.
 
 CRITICAL: Claim must succeed before any side-effects (settle/refund/S3 pointers).
+
+Spec reference (Section 9.1, Step 7):
+  (A) claim:
+    WHERE: status='PROCESSING' AND version=:v AND lease_token=:lease_token
+           AND finalize_stage IS NULL
+    SET:   finalize_token=:uuid, finalize_stage='CLAIMED', version=v+1
+
+  (B) side-effects (winner only):
+    settle: charge = min(actual_cost, reserved)
+    final commit:
+      WHERE: run_id=:id AND version=:v_claimed AND finalize_token=:token
+             AND finalize_stage='CLAIMED'
+      SET:   status='COMPLETED', money_state='SETTLED', finalize_stage='COMMITTED', version+1
 """
 
 import uuid
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
@@ -38,7 +51,7 @@ def finalize_success(
     result_sha256: str,
     db: Session,
     budget_manager: BudgetManager,
-) -> Literal["WINNER", "LOSER"]:
+) -> Literal["WINNER"]:
     """2-phase finalize for successful run completion (COMPLETED + SETTLED).
 
     Phase A (Claim): Acquire exclusive right to finalize using DB-CAS
@@ -47,7 +60,7 @@ def finalize_success(
     Args:
         run_id: Run ID
         tenant_id: Tenant ID
-        lease_token: Lease token from worker
+        lease_token: Lease token from worker (used in claim WHERE condition)
         actual_cost_usd_micros: Actual cost to charge (USD_MICROS)
         result_bucket: S3 bucket name
         result_key: S3 object key
@@ -56,7 +69,7 @@ def finalize_success(
         budget_manager: Budget manager instance
 
     Returns:
-        "WINNER" if finalize succeeded, "LOSER" if lost race
+        "WINNER" if finalize succeeded
 
     Raises:
         ClaimError: If claim phase fails (loser)
@@ -74,13 +87,29 @@ def finalize_success(
             f"Run {run_id} status is {run.status}, expected PROCESSING (already finalized)"
         )
 
+    # C-5: Validate money_state before attempting settle (Golden Rule)
+    if run.money_state != "RESERVED":
+        raise FinalizeError(
+            f"Run {run_id} money_state is {run.money_state}, expected RESERVED"
+        )
+
+    # DEC-4211: actual_cost must not exceed reservation (pre-check before claim)
+    if actual_cost_usd_micros > run.reservation_max_cost_usd_micros:
+        raise FinalizeError(
+            f"Actual cost {actual_cost_usd_micros} exceeds "
+            f"reserved {run.reservation_max_cost_usd_micros}"
+        )
+
+    # ========================================
     # PHASE A: CLAIM (DB-CAS)
+    # ========================================
     # Generate finalize_token for this finalize attempt
     finalize_token = str(uuid.uuid4())
     current_version = run.version
 
-    # Attempt to claim exclusive right to finalize
-    # CRITICAL: This must succeed before any side-effects
+    # Spec 9.1 Step 7-A: Attempt to claim exclusive right to finalize
+    # WHERE: status='PROCESSING' AND version=:v AND lease_token=:lease_token
+    #        AND finalize_stage IS NULL
     success = repo.update_with_version_check(
         run_id=run_id,
         tenant_id=tenant_id,
@@ -89,7 +118,11 @@ def finalize_success(
             "finalize_stage": "CLAIMED",
             "finalize_token": finalize_token,
             "finalize_claimed_at": datetime.now(timezone.utc),
-            # version will be incremented automatically
+        },
+        extra_conditions={
+            "status": "PROCESSING",
+            "lease_token": lease_token,
+            "finalize_stage": None,  # IS NULL
         },
     )
 
@@ -97,65 +130,50 @@ def finalize_success(
         # Lost race - another worker or reaper already claimed
         raise ClaimError(f"Run {run_id} already claimed by another process")
 
-    # WINNER - Claim succeeded!
-    # Now it's safe to perform side-effects
+    # ========================================
+    # PHASE B: SIDE-EFFECTS (winner only)
+    # ========================================
 
-    try:
-        # PHASE B: SIDE-EFFECTS (winner only)
+    # 1. Settle budget (charge actual cost, refund excess)
+    settle_status, charge, refund, new_balance = budget_manager.scripts.settle(
+        tenant_id, run_id, actual_cost_usd_micros
+    )
 
-        # 1. Settle budget (charge actual cost, refund excess)
-        # DEC-4211: actual_cost must not exceed reservation
-        if actual_cost_usd_micros > run.reservation_max_cost_usd_micros:
-            raise FinalizeError(
-                f"Actual cost {actual_cost_usd_micros} exceeds "
-                f"reserved {run.reservation_max_cost_usd_micros}"
-            )
+    if settle_status != "OK":
+        raise FinalizeError(f"Settle failed: {settle_status}")
 
-        settle_status, charge, refund, new_balance = budget_manager.scripts.settle(
-            tenant_id, run_id, actual_cost_usd_micros
+    # 2. Final DB commit with result pointers
+    # Spec 9.1 Step 7-B:
+    # WHERE: run_id=:id AND version=:v_claimed AND finalize_token=:token
+    #        AND finalize_stage='CLAIMED'
+    claimed_version = current_version + 1  # Version was incremented by claim
+
+    final_success = repo.update_with_version_check(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        expected_version=claimed_version,
+        updates={
+            "status": "COMPLETED",
+            "money_state": "SETTLED",
+            "actual_cost_usd_micros": actual_cost_usd_micros,
+            "result_bucket": result_bucket,
+            "result_key": result_key,
+            "result_sha256": result_sha256,
+            "finalize_stage": "COMMITTED",
+        },
+        extra_conditions={
+            "finalize_token": finalize_token,
+            "finalize_stage": "CLAIMED",
+        },
+    )
+
+    if not final_success:
+        # This should never happen unless DB corruption
+        raise FinalizeError(
+            f"Final commit failed for run {run_id} despite successful claim"
         )
 
-        if settle_status != "OK":
-            raise FinalizeError(f"Settle failed: {settle_status}")
-
-        # 2. Final DB commit with result pointers
-        # Get current version after claim (version was incremented)
-        run_after_claim = repo.get_by_id(run_id, tenant_id)
-        if not run_after_claim:
-            raise FinalizeError(f"Run {run_id} disappeared after claim")
-
-        claimed_version = run_after_claim.version
-
-        final_success = repo.update_with_version_check(
-            run_id=run_id,
-            tenant_id=tenant_id,
-            expected_version=claimed_version,
-            updates={
-                "status": "COMPLETED",
-                "money_state": "SETTLED",
-                "actual_cost_usd_micros": actual_cost_usd_micros,
-                "result_bucket": result_bucket,
-                "result_key": result_key,
-                "result_sha256": result_sha256,
-                "finalize_stage": "COMMITTED",
-                # finalize_token remains (for audit)
-                # version will be incremented automatically
-            },
-        )
-
-        if not final_success:
-            # This should never happen unless DB corruption
-            raise FinalizeError(
-                f"Final commit failed for run {run_id} despite successful claim"
-            )
-
-        return "WINNER"
-
-    except Exception as e:
-        # If side-effects fail after claim, we have a problem
-        # The claim succeeded but we couldn't complete
-        # This will be handled by reconciliation job
-        raise FinalizeError(f"Failed during side-effects after claim: {e}") from e
+    return "WINNER"
 
 
 def finalize_failure(
@@ -167,7 +185,7 @@ def finalize_failure(
     error_detail: str,
     db: Session,
     budget_manager: BudgetManager,
-) -> Literal["WINNER", "LOSER"]:
+) -> Literal["WINNER"]:
     """2-phase finalize for failed run (FAILED + SETTLED with minimum_fee).
 
     Similar to finalize_success but:
@@ -178,7 +196,7 @@ def finalize_failure(
     Args:
         run_id: Run ID
         tenant_id: Tenant ID
-        lease_token: Lease token from worker
+        lease_token: Lease token from worker (used in claim WHERE condition)
         minimum_fee_usd_micros: Minimum fee to charge (USD_MICROS)
         error_reason_code: Error reason code
         error_detail: Error detail message
@@ -186,7 +204,7 @@ def finalize_failure(
         budget_manager: Budget manager instance
 
     Returns:
-        "WINNER" if finalize succeeded, "LOSER" if lost race
+        "WINNER" if finalize succeeded
 
     Raises:
         ClaimError: If claim phase fails (loser)
@@ -204,10 +222,19 @@ def finalize_failure(
             f"Run {run_id} status is {run.status}, expected PROCESSING (already finalized)"
         )
 
+    # C-5: Validate money_state before attempting settle (Golden Rule)
+    if run.money_state != "RESERVED":
+        raise FinalizeError(
+            f"Run {run_id} money_state is {run.money_state}, expected RESERVED"
+        )
+
+    # ========================================
     # PHASE A: CLAIM
+    # ========================================
     finalize_token = str(uuid.uuid4())
     current_version = run.version
 
+    # Spec 9.1 Step 7-A (same conditions as success path)
     success = repo.update_with_version_check(
         run_id=run_id,
         tenant_id=tenant_id,
@@ -217,57 +244,59 @@ def finalize_failure(
             "finalize_token": finalize_token,
             "finalize_claimed_at": datetime.now(timezone.utc),
         },
+        extra_conditions={
+            "status": "PROCESSING",
+            "lease_token": lease_token,
+            "finalize_stage": None,  # IS NULL
+        },
     )
 
     if not success:
         raise ClaimError(f"Run {run_id} already claimed by another process")
 
-    # WINNER - Claim succeeded!
+    # ========================================
+    # PHASE B: SIDE-EFFECTS (winner only)
+    # ========================================
 
-    try:
-        # PHASE B: SIDE-EFFECTS
-
-        # 1. Settle budget with minimum_fee
-        if minimum_fee_usd_micros > run.reservation_max_cost_usd_micros:
-            raise FinalizeError(
-                f"Minimum fee {minimum_fee_usd_micros} exceeds "
-                f"reserved {run.reservation_max_cost_usd_micros}"
-            )
-
-        settle_status, charge, refund, new_balance = budget_manager.scripts.settle(
-            tenant_id, run_id, minimum_fee_usd_micros
+    # 1. Settle budget with minimum_fee
+    if minimum_fee_usd_micros > run.reservation_max_cost_usd_micros:
+        raise FinalizeError(
+            f"Minimum fee {minimum_fee_usd_micros} exceeds "
+            f"reserved {run.reservation_max_cost_usd_micros}"
         )
 
-        if settle_status != "OK":
-            raise FinalizeError(f"Settle failed: {settle_status}")
+    settle_status, charge, refund, new_balance = budget_manager.scripts.settle(
+        tenant_id, run_id, minimum_fee_usd_micros
+    )
 
-        # 2. Final DB commit with error details
-        run_after_claim = repo.get_by_id(run_id, tenant_id)
-        if not run_after_claim:
-            raise FinalizeError(f"Run {run_id} disappeared after claim")
+    if settle_status != "OK":
+        raise FinalizeError(f"Settle failed: {settle_status}")
 
-        claimed_version = run_after_claim.version
+    # 2. Final DB commit with error details
+    # Spec 9.1 Step 7-B (with finalize_token + finalize_stage conditions)
+    claimed_version = current_version + 1
 
-        final_success = repo.update_with_version_check(
-            run_id=run_id,
-            tenant_id=tenant_id,
-            expected_version=claimed_version,
-            updates={
-                "status": "FAILED",
-                "money_state": "SETTLED",
-                "actual_cost_usd_micros": minimum_fee_usd_micros,
-                "last_error_reason_code": error_reason_code,
-                "last_error_detail": error_detail,
-                "finalize_stage": "COMMITTED",
-            },
+    final_success = repo.update_with_version_check(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        expected_version=claimed_version,
+        updates={
+            "status": "FAILED",
+            "money_state": "SETTLED",
+            "actual_cost_usd_micros": minimum_fee_usd_micros,
+            "last_error_reason_code": error_reason_code,
+            "last_error_detail": error_detail,
+            "finalize_stage": "COMMITTED",
+        },
+        extra_conditions={
+            "finalize_token": finalize_token,
+            "finalize_stage": "CLAIMED",
+        },
+    )
+
+    if not final_success:
+        raise FinalizeError(
+            f"Final commit failed for run {run_id} despite successful claim"
         )
 
-        if not final_success:
-            raise FinalizeError(
-                f"Final commit failed for run {run_id} despite successful claim"
-            )
-
-        return "WINNER"
-
-    except Exception as e:
-        raise FinalizeError(f"Failed during side-effects after claim: {e}") from e
+    return "WINNER"
