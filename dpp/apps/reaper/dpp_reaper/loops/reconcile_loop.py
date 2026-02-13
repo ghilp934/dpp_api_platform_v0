@@ -24,7 +24,6 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from dpp_api.budget import BudgetManager
-from dpp_api.constants import RESERVATION_TTL_SECONDS
 from dpp_api.db.models import Run
 from dpp_api.db.redis_client import RedisClient
 from dpp_api.db.repo_runs import RunRepository
@@ -356,24 +355,21 @@ def reconcile_stuck_claimed_run(
     db: Session,
     budget_manager: BudgetManager,
 ) -> bool:
-    """MS-6: Idempotent finalize reconciliation for stuck CLAIMED runs.
+    """MS-6: Receipt-based idempotent finalize reconciliation.
+
+    CRITICAL PRINCIPLE: Settlement receipt is the ONLY authoritative proof
+    that settle() succeeded. NO inference, NO estimation - proof only.
 
     This function handles the critical scenario where:
     1. Worker claimed finalize (finalize_stage='CLAIMED')
-    2. Redis settle succeeded (reservation consumed)
+    2. Redis settle() succeeded → settlement receipt created
     3. DB commit failed (still money_state='RESERVED')
     → Result: Inconsistent state (Redis settled, DB not updated)
 
-    Safety Guard #1 - TTL Safety Check:
-    - If age < RESERVATION_TTL: Safe to assume Redis settle succeeded
-    - If age >= RESERVATION_TTL: Ambiguous (could be expired) → AUDIT_REQUIRED
-
-    Safety Guard #2 - Source of Truth for Cost:
-    - Priority 1: S3 metadata 'actual-cost-usd-micros'
-    - Priority 2: reservation_max_cost (conservative fallback)
-
-    Safety Guard #3 - Strict Scoping:
-    - Only updates runs in CLAIMED+RESERVED state (enforced by repo method)
+    Resolution:
+    - Case 1) Reservation exists → Use standard reconcile (roll-forward/back)
+    - Case 2) Reservation missing + Receipt exists → Proof-based DB update
+    - Case 3) Reservation missing + No receipt → AUDIT_REQUIRED (no auto-settle)
 
     Args:
         run: Stuck run to reconcile
@@ -398,37 +394,22 @@ def reconcile_stuck_claimed_run(
         )
         return reconcile_stuck_run(run, db, budget_manager)
 
-    # CRITICAL: Reservation missing - need TTL safety check
-    # Safety Guard #1: TTL-based disambiguation
-    # Use centralized constant to prevent drift (MS-6 critical)
+    # CRITICAL: Reservation missing - check settlement receipt
+    # MS-6 PRINCIPLE: Receipt is the ONLY proof of settlement
+    receipt = budget_manager.scripts.get_settlement_receipt(run_id)
 
-    # Handle both naive and aware datetimes (defensive programming)
-    created_at = run.created_at
-    if created_at.tzinfo is None:
-        # Assume UTC for naive datetimes
-        created_at = created_at.replace(tzinfo=timezone.utc)
-
-    age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
-
-    if age_seconds >= RESERVATION_TTL_SECONDS:
-        # Safety Guard #1: Age >= TTL → Ambiguous case (could be expired/evicted)
+    if not receipt:
+        # NO RECEIPT = NO PROOF of settlement
+        # MUST NOT auto-settle (violates "proof-only" principle)
         logger.warning(
-            f"MS-6: Run {run_id} age={age_seconds:.0f}s >= TTL={RESERVATION_TTL_SECONDS}s, "
-            f"marking AUDIT_REQUIRED (ambiguous reservation missing)",
+            f"MS-6: Run {run_id} has no reservation AND no receipt, marking AUDIT_REQUIRED",
             extra={
                 "run_id": run_id,
-                "age_seconds": age_seconds,
-                "ttl_seconds": RESERVATION_TTL_SECONDS,
-                "reconcile_type": "audit_required",
+                "reconcile_type": "no_receipt_audit",
             },
         )
 
-        # Mark for manual audit (charge minimum_fee conservatively)
-        charge_minimum_fee = min(
-            run.minimum_fee_usd_micros or 0,
-            run.reservation_max_cost_usd_micros or 0,
-        )
-
+        # Mark for manual audit (NO charge - unknown state)
         success = repo.update_with_version_check(
             run_id=run_id,
             tenant_id=tenant_id,
@@ -436,57 +417,59 @@ def reconcile_stuck_claimed_run(
             updates={
                 "status": "FAILED",
                 "money_state": "AUDIT_REQUIRED",
-                "actual_cost_usd_micros": charge_minimum_fee,
+                "actual_cost_usd_micros": 0,  # Unknown - manual verification needed
                 "finalize_stage": "COMMITTED",
-                "last_error_reason_code": "MS6_AMBIGUOUS_RESERVATION_MISSING",
-                "last_error_detail": f"Reservation missing after TTL expiry (age={age_seconds:.0f}s >= {RESERVATION_TTL_SECONDS}s)",
+                "last_error_reason_code": "MS6_NO_SETTLEMENT_RECEIPT",
+                "last_error_detail": "Reservation missing with no settlement receipt (manual reconciliation required)",
                 "completed_at": datetime.now(timezone.utc),
             },
         )
         return success
 
-    # Safety Guard #1: Age < TTL → Safe to assume settle already succeeded
+    # RECEIPT FOUND! This is AUTHORITATIVE PROOF that settle() succeeded
+    # Use receipt.charged_usd_micros as the ONLY source of truth
+    charged_usd_micros = int(receipt["charged_usd_micros"])
+    tenant_id_from_receipt = receipt["tenant_id"]
+
+    # Security: Verify tenant_id matches
+    if tenant_id_from_receipt != tenant_id:
+        logger.error(
+            f"MS-6: Receipt tenant mismatch! run={run_id} db_tenant={tenant_id} receipt_tenant={tenant_id_from_receipt}",
+            extra={
+                "run_id": run_id,
+                "db_tenant_id": tenant_id,
+                "receipt_tenant_id": tenant_id_from_receipt,
+            },
+        )
+        return False
+
     logger.info(
-        f"MS-6: Run {run_id} age={age_seconds:.0f}s < TTL={RESERVATION_TTL_SECONDS}s, "
-        f"safe to assume settle succeeded (idempotent force-settle)",
+        f"MS-6: Found settlement receipt for run {run_id} (charged={charged_usd_micros})",
         extra={
             "run_id": run_id,
-            "age_seconds": age_seconds,
-            "ttl_seconds": RESERVATION_TTL_SECONDS,
-            "reconcile_type": "idempotent_force_settle",
+            "charged_usd_micros": charged_usd_micros,
+            "reconcile_type": "receipt_reconcile",
         },
     )
 
-    # Safety Guard #2: Extract actual_cost from S3 or use fallback
+    # Determine final status based on S3 existence
     s3_exists = check_s3_result_exists(run)
 
     if s3_exists:
-        # Extract cost from S3 metadata (Priority 1)
-        from dpp_api.storage.s3_client import get_s3_client
-        s3_client = get_s3_client()
-        actual_cost = s3_client.estimate_actual_cost_from_s3(
-            bucket=run.result_bucket,
-            key=run.result_key,
-            fallback_max_cost=run.reservation_max_cost_usd_micros,
-        )
         final_status = "COMPLETED"
         error_reason = None
         error_detail = None
     else:
-        # S3 missing - charge minimum_fee (Priority 2 fallback)
-        actual_cost = min(
-            run.minimum_fee_usd_micros or 0,
-            run.reservation_max_cost_usd_micros or 0,
-        )
         final_status = "FAILED"
-        error_reason = "MS6_S3_MISSING_AFTER_SETTLE"
-        error_detail = "S3 upload missing but Redis settle succeeded (charged minimum_fee)"
+        error_reason = "MS6_S3_MISSING_AFTER_SETTLEMENT"
+        error_detail = "S3 upload missing despite successful settlement"
 
-    # Safety Guard #3: Force update ONLY if in CLAIMED+RESERVED state
+    # Guarded update (NOT force update)
+    # Only update if run is still in CLAIMED+RESERVED state
     updates = {
         "status": final_status,
         "money_state": "SETTLED",
-        "actual_cost_usd_micros": actual_cost,
+        "actual_cost_usd_micros": charged_usd_micros,  # From receipt (authoritative!)
         "finalize_stage": "COMMITTED",
         "completed_at": datetime.now(timezone.utc),
     }
@@ -495,38 +478,51 @@ def reconcile_stuck_claimed_run(
     if error_detail:
         updates["last_error_detail"] = error_detail
 
-    success = repo.force_update_claimed_only(run_id=run_id, updates=updates)
+    # Use update_with_version_check (guarded) NOT force_update
+    # This ensures idempotency: if another path already committed, we skip
+    success = repo.update_with_version_check(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        expected_version=run.version,
+        updates=updates,
+        extra_conditions={
+            "finalize_stage": "CLAIMED",  # Must still be CLAIMED
+            "finalize_token": run.finalize_token,  # Token must match
+        },
+    )
 
-    if success:
+    if not success:
+        # Version mismatch or already committed by another path
         logger.info(
-            f"MS-6: Idempotent force-settle succeeded for run {run_id} "
-            f"(status={final_status}, cost={actual_cost})",
-            extra={
-                "run_id": run_id,
-                "tenant_id": tenant_id,
-                "final_status": final_status,
-                "actual_cost_usd_micros": actual_cost,
-                "s3_exists": s3_exists,
-            },
-        )
-
-        # Record usage (metering)
-        try:
-            updated_run = repo.get_by_id(run_id, tenant_id)
-            if updated_run:
-                from dpp_api.metering import UsageTracker
-                usage_tracker = UsageTracker(db)
-                usage_tracker.record_run_completion(updated_run)
-        except Exception as e:
-            logger.error(f"Failed to record usage for run {run_id}: {e}", exc_info=True)
-
-        return True
-    else:
-        logger.warning(
-            f"MS-6: Force-settle failed for run {run_id} (not in CLAIMED+RESERVED state)",
+            f"MS-6: Receipt reconcile skipped for run {run_id} (already processed by another path)",
             extra={"run_id": run_id},
         )
         return False
+
+    # Success! DB is now SETTLED based on receipt proof
+    logger.info(
+        f"MS-6: Receipt-based reconcile succeeded for run {run_id} "
+        f"(status={final_status}, charged={charged_usd_micros})",
+        extra={
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "final_status": final_status,
+            "charged_usd_micros": charged_usd_micros,
+            "s3_exists": s3_exists,
+        },
+    )
+
+    # Record usage (metering)
+    try:
+        updated_run = repo.get_by_id(run_id, tenant_id)
+        if updated_run:
+            from dpp_api.metering import UsageTracker
+            usage_tracker = UsageTracker(db)
+            usage_tracker.record_run_completion(updated_run)
+    except Exception as e:
+        logger.error(f"Failed to record usage for run {run_id}: {e}", exc_info=True)
+
+    return True
 
 
 def reconcile_loop(

@@ -44,9 +44,11 @@ return {"OK", tostring(bal - reserved)}
 
 # Settle.lua - Settle reservation and return refund
 # CRITICAL: Prevents overcharge attacks and negative balance
+# MS-6: Creates settlement receipt for idempotent reconciliation
 SETTLE_LUA = """
 local budget_key = KEYS[1]
 local reserve_key = KEYS[2]
+local receipt_key = KEYS[3]
 local charge = tonumber(ARGV[1])
 
 if redis.call("EXISTS", reserve_key) ~= 1 then
@@ -54,6 +56,7 @@ if redis.call("EXISTS", reserve_key) ~= 1 then
 end
 
 local reserved = tonumber(redis.call("HGET", reserve_key, "reserved_usd_micros") or "0")
+local tenant_id = redis.call("HGET", reserve_key, "tenant_id") or ""
 
 -- CRITICAL: Prevent negative charge (attack vector)
 if charge < 0 then
@@ -76,6 +79,22 @@ if bal < 0 then
 end
 
 redis.call("SET", budget_key, tostring(bal))
+
+-- MS-6: Create settlement receipt (proof of settlement)
+-- This is the ONLY authoritative source for "settlement happened"
+local time_parts = redis.call("TIME")
+local settled_at = time_parts[1]  -- Unix timestamp (seconds)
+
+redis.call("HMSET", receipt_key,
+  "tenant_id", tenant_id,
+  "charged_usd_micros", tostring(charge),
+  "reserved_usd_micros", tostring(reserved),
+  "refund_usd_micros", tostring(refund),
+  "settled_at", settled_at
+)
+-- TTL: 30 days (must be >= max retention_until)
+redis.call("EXPIRE", receipt_key, 2592000)
+
 redis.call("DEL", reserve_key)
 return {"OK", tostring(charge), tostring(refund), tostring(bal)}
 """
@@ -169,6 +188,11 @@ class BudgetScripts:
         else:  # ERR_ALREADY_RESERVED
             return ("ERR_ALREADY_RESERVED", 0)
 
+    @staticmethod
+    def receipt_key(run_id: str) -> str:
+        """Generate settlement receipt key (MS-6)."""
+        return f"settle_receipt:{run_id}"
+
     def settle(
         self, tenant_id: str, run_id: str, charge_usd_micros: int
     ) -> tuple[
@@ -176,6 +200,9 @@ class BudgetScripts:
     ]:  # (status, charge, refund, new_balance)
         """
         Settle reservation with actual charge.
+
+        MS-6: Creates settlement receipt for idempotent reconciliation.
+        Receipt is the ONLY authoritative proof that settlement occurred.
 
         Args:
             tenant_id: Tenant ID
@@ -189,12 +216,14 @@ class BudgetScripts:
         """
         budget_key = self.budget_key(tenant_id)
         reserve_key = self.reserve_key(run_id)
+        receipt_key = self.receipt_key(run_id)
 
         result = self.redis.evalsha(
             self.settle_sha,
-            2,  # num keys
+            3,  # num keys (MS-6: added receipt_key)
             budget_key,
             reserve_key,
+            receipt_key,
             str(charge_usd_micros),
         )
 
@@ -206,6 +235,39 @@ class BudgetScripts:
             return ("OK", charge, refund, new_balance)
         else:  # ERR_NO_RESERVE
             return ("ERR_NO_RESERVE", 0, 0, 0)
+
+    def get_settlement_receipt(
+        self, run_id: str
+    ) -> Optional[dict[str, str]]:
+        """
+        Get settlement receipt for a run (MS-6).
+
+        Settlement receipt is the authoritative proof that settle() succeeded.
+        Used for idempotent reconciliation when DB commit fails after settlement.
+
+        Args:
+            run_id: Run ID
+
+        Returns:
+            Receipt dict if found, None otherwise
+            - tenant_id: Tenant ID
+            - charged_usd_micros: Actual charge (string)
+            - reserved_usd_micros: Original reservation (string)
+            - refund_usd_micros: Refund amount (string)
+            - settled_at: Unix timestamp (string)
+        """
+        receipt_key = self.receipt_key(run_id)
+        receipt = self.redis.hgetall(receipt_key)
+
+        if not receipt:
+            return None
+
+        # Convert bytes keys/values to strings
+        return {
+            k.decode("utf-8") if isinstance(k, bytes) else k:
+            v.decode("utf-8") if isinstance(v, bytes) else v
+            for k, v in receipt.items()
+        }
 
     def refund_full(
         self, tenant_id: str, run_id: str

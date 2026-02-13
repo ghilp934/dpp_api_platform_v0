@@ -318,6 +318,14 @@ def test_chaos_crash_after_settle_before_db_commit_requires_reconcile(db_session
     assert run.finalize_stage == "CLAIMED"
     assert run.money_state == "RESERVED"
 
+    # MS-6: Verify settlement receipt was created (PROOF of settlement!)
+    receipt = budget_manager.scripts.get_settlement_receipt(run.run_id)
+    assert receipt is not None, "Settlement receipt should exist (proof of settle success)"
+    assert int(receipt["charged_usd_micros"]) == 500_000, "Receipt should have correct charge"
+    assert receipt["tenant_id"] == run.tenant_id, "Receipt should have correct tenant_id"
+
+    print(f"\n[MS-6] Settlement receipt verified: charged={receipt['charged_usd_micros']}")
+
     # Setup S3 result info (simulating Worker had uploaded before crash)
     run.result_bucket = "test-bucket"
     run.result_key = "test-results/test-key"
@@ -335,18 +343,18 @@ def test_chaos_crash_after_settle_before_db_commit_requires_reconcile(db_session
 
     from dpp_reaper.loops.reconcile_loop import reconcile_stuck_claimed_run
 
-    # Mock S3 API to simulate successful S3 upload with actual_cost metadata
+    # Mock S3 API to determine final status (COMPLETED vs FAILED)
+    # NOTE: actual_cost comes from receipt, NOT S3!
     with patch("dpp_reaper.loops.reconcile_loop.check_s3_result_exists", return_value=True):
-        with patch("dpp_api.storage.s3_client.S3Client.estimate_actual_cost_from_s3", return_value=500_000):
-            # Run MS-6 idempotent reconcile
-            success = reconcile_stuck_claimed_run(run, db_session, budget_manager)
-            assert success, "MS-6 reconcile should succeed"
+        # Run MS-6 receipt-based idempotent reconcile
+        success = reconcile_stuck_claimed_run(run, db_session, budget_manager)
+        assert success, "MS-6 reconcile should succeed"
 
     # VERIFY: DB should now be consistent (COMMITTED+SETTLED)
     db_session.refresh(run)
     assert run.finalize_stage == "COMMITTED"
     assert run.money_state == "SETTLED"
     assert run.status == "COMPLETED"
-    assert run.actual_cost_usd_micros == 500_000  # Should preserve the original charge
+    assert run.actual_cost_usd_micros == 500_000  # From receipt (authoritative proof!)
 
-    print("\n[PASS] MS-6: Idempotent reconcile recovered stuck CLAIMED run after settle succeeded.")
+    print("\n[PASS] MS-6: Receipt-based idempotent reconcile recovered stuck CLAIMED run.")

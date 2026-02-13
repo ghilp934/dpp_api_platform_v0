@@ -200,17 +200,12 @@ class RunRepository:
         run_id: str,
         updates: dict[str, Any],
     ) -> bool:
-        """Force update ONLY runs in CLAIMED limbo state (MS-6 Safety Guard #3).
+        """DEPRECATED: Use receipt-based reconciliation instead.
 
-        CRITICAL SAFETY: This bypasses version check but has strict conditions:
-        - run_id must match exactly
-        - finalize_stage must be 'CLAIMED'
-        - money_state must be 'RESERVED'
+        This method is deprecated since MS-6 receipt-based reconciliation.
+        Settlement receipt is the ONLY authoritative proof of settlement.
 
-        This prevents accidental force updates on:
-        - Already COMMITTED runs
-        - Runs in other states
-        - Wrong run IDs
+        Use update_with_version_check() with settlement receipt proof instead.
 
         Args:
             run_id: Run ID (exact match required)
