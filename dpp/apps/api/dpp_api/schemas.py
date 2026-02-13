@@ -107,12 +107,14 @@ class ProblemDetail(BaseModel):
     """RFC 9457 Problem Details for HTTP API errors.
 
     Used for plan enforcement violations and other API errors.
+
+    RFC 9457: detail can be either a string or a structured object (dict).
     """
 
     type: str = Field(..., description="URI reference identifying the problem type")
     title: str = Field(..., description="Short, human-readable summary")
     status: int = Field(..., description="HTTP status code")
-    detail: str = Field(..., description="Human-readable explanation specific to this occurrence")
+    detail: str | dict[str, Any] = Field(..., description="Human-readable explanation or structured error details")
     instance: Optional[str] = Field(None, description="URI reference identifying the specific occurrence")
 
 

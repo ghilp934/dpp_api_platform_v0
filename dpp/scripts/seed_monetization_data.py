@@ -137,8 +137,10 @@ def seed_data():
 
         # 4. Create API Key
         print("\nCreating API Key...")
-        api_key_plaintext = f"dpp_test_{uuid.uuid4().hex[:16]}"
+        # P0-3: Generate API key in correct format: sk_{key_id}_{secret}
         key_id = str(uuid.uuid4())
+        secret = uuid.uuid4().hex[:32]  # 32-char hex secret
+        api_key_plaintext = f"sk_{key_id}_{secret}"
 
         existing_key = db.query(APIKey).filter_by(key_id=key_id).first()
         if not existing_key:
@@ -155,6 +157,7 @@ def seed_data():
             db.flush()
             print(f"[OK] Created API Key: {api_key_plaintext}")
             print(f"  (Save this key - it won't be shown again)")
+            print(f"  Format: sk_{{key_id}}_{{secret}}")
         else:
             print("[OK] API Key already exists")
 

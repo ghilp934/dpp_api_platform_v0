@@ -114,12 +114,17 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 
     Returns application/problem+json with top-level RFC 9457 fields.
     No {"detail": ...} wrapper.
+
+    P0-1: Preserves dict detail fields for structured error responses (RFC 9457 compliant).
     """
+    # P0-1: Don't force-cast detail to str - preserve dict if provided
+    detail_value = exc.detail if exc.detail is not None else _get_title_for_status(exc.status_code)
+
     problem = ProblemDetail(
         type=f"https://dpp.example.com/problems/http-{exc.status_code}",
         title=_get_title_for_status(exc.status_code),
         status=exc.status_code,
-        detail=str(exc.detail) if exc.detail else _get_title_for_status(exc.status_code),
+        detail=detail_value,
         instance=request.url.path,
     )
 
